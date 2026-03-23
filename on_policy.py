@@ -9,7 +9,7 @@ from gymnasium.spaces import Box
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
+from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor, SubprocVecEnv
 from stable_baselines3.common.callbacks import BaseCallback, EvalCallback, CheckpointCallback
 from stable_baselines3.common.monitor import Monitor
 
@@ -109,6 +109,59 @@ def make_env(render_mode=None):
         return env
     return _init
 
+# ─────────────────────────────────────────────
+# CUSTOM CALLBACK — TensorBoard snapshot every 10k steps
+# ─────────────────────────────────────────────
+ 
+class TensorboardCallback(BaseCallback):
+    """
+    Logs a rich set of training metrics to TensorBoard every LOG_FREQ steps.
+ 
+    Metrics written
+    ───────────────
+    <run_name>/ep_rew_mean    — mean episode return over the logging window
+    <run_name>/ep_rew_min     — min episode return in the window
+    <run_name>/ep_rew_max     — max episode return in the window
+    <run_name>/ep_len_mean    — mean episode length over the logging window
+    <run_name>/episodes_total — cumulative episode count
+ 
+    Using run_name as the tag prefix means multiple runs appear as
+    separate, labelled series in TensorBoard for direct comparison.
+    """
+ 
+    def __init__(self, log_freq: int = 10_000, run_name: str = "run"):
+        super().__init__(verbose=0)
+        self.log_freq        = log_freq
+        self.run_name        = run_name
+        self._window_returns: list[float] = []
+        self._window_lengths: list[float] = []
+        self._total_episodes: int         = 0
+ 
+    def _on_step(self) -> bool:
+        # Monitor injects an "episode" key into info when an episode ends
+        for info in self.locals["infos"]:
+            if "episode" in info:
+                self._window_returns.append(float(info["episode"]["r"]))
+                self._window_lengths.append(float(info["episode"]["l"]))
+                self._total_episodes += 1
+ 
+        if self.num_timesteps % self.log_freq == 0 and self._window_returns:
+            rew_arr = np.array(self._window_returns)
+            len_arr = np.array(self._window_lengths)
+ 
+            self.logger.record(f"{self.run_name}/ep_rew_mean",    float(rew_arr.mean()))
+            self.logger.record(f"{self.run_name}/ep_rew_min",     float(rew_arr.min()))
+            self.logger.record(f"{self.run_name}/ep_rew_max",     float(rew_arr.max()))
+            self.logger.record(f"{self.run_name}/ep_len_mean",    float(len_arr.mean()))
+            self.logger.record(f"{self.run_name}/episodes_total", self._total_episodes)
+            self.logger.dump(self.num_timesteps)  # flush to disk at this step
+ 
+            # Reset window for next interval
+            self._window_returns.clear()
+            self._window_lengths.clear()
+ 
+        return True
+
 
 # ─────────────────────────────────────────────
 # CUSTOM CALLBACK — live training log
@@ -142,12 +195,12 @@ TOTAL_TIMESTEPS = 2_000_000
 # ── Parallel env scaling for RTX 5090 ────────────────────────────────────────
 import os
 _logical_cores = os.cpu_count() or 8
-N_ENVS = max(4, min(_logical_cores * 2, 64))  # auto-scale, capped at 64
+N_ENVS = 8
 print(f"Auto-selected N_ENVS={N_ENVS} for {_logical_cores} logical CPU cores")
  
 # Also scale the batch size up so minibatch count stays reasonable.
 # PPO paper recommendation: total_steps / batch_size >= 32 minibatches/update.
-_DYNAMIC_BATCH = min(256, (2048 * N_ENVS) // 32)
+_DYNAMIC_BATCH = 256
 
 
 # ─────────────────────────────────────────────
@@ -181,21 +234,29 @@ PPO_KWARGS = dict(
 # TRAINING
 # ─────────────────────────────────────────────
 
-def train():
+def train(run_name: str = "ppo_run_1"):
+    """
+    run_name  labels this run inside TensorBoard.
+    Use a different name each time (e.g. "ppo_lr3e4", "ppo_ent01") so
+    multiple runs appear as separate series for comparison.
+    """
+    print(f"Run: {run_name}")
     print("Setting up vectorised environments…")
-
-    # DummyVecEnv runs envs sequentially in one process (safe, simple).
-    # Swap for SubprocVecEnv for true parallelism (requires __main__ guard).
-    vec_env = DummyVecEnv([make_env() for _ in range(N_ENVS)])
+ 
+    # SubprocVecEnv spawns each env in its own process — true parallelism.
+    # Requires the script to be run under `if __name__ == '__main__'` (already done).
+    vec_env = SubprocVecEnv([make_env() for _ in range(N_ENVS)], start_method='fork')
     vec_env = VecMonitor(vec_env)  # aggregates episode stats across envs
-
+ 
     # Separate single env used by EvalCallback for unbiased evaluation
     eval_env = DummyVecEnv([make_env()])
     eval_env = VecMonitor(eval_env)
-
+ 
     # ── Callbacks ─────────────────────────────────────────────────────────────
     log_callback = TrainingLogCallback(log_freq=2048)
-
+ 
+    tb_callback  = TensorboardCallback(log_freq=10_000, run_name=run_name)
+ 
     eval_callback = EvalCallback(
         eval_env,
         best_model_save_path = "./ppo_franka_best/",
@@ -206,33 +267,36 @@ def train():
         render               = False,
         verbose              = 1,
     )
-
+ 
     checkpoint_callback = CheckpointCallback(
-        save_freq  = 50_000,
+        save_freq  = 50_000,             # save a checkpoint every N timesteps
         save_path  = "./ppo_franka_checkpoints/",
         name_prefix= "ppo_franka",
         verbose    = 1,
     )
-
+ 
     # ── Model ─────────────────────────────────────────────────────────────────
+    # MLP networks are small (2x256 layers) — CPU is faster than GPU here
+    # because per-batch compute is trivial and GPU transfer overhead dominates.
+    # The 5090 is better spent on CNN/transformer policies or SAC.
     model = PPO("MlpPolicy", vec_env, **PPO_KWARGS, device="cpu")
-
+ 
     print(f"\nPolicy architecture:\n{model.policy}\n")
     print(f"Training for {TOTAL_TIMESTEPS:,} timesteps across {N_ENVS} parallel envs…\n")
-
+ 
     model.learn(
         total_timesteps = TOTAL_TIMESTEPS,
-        callback        = [log_callback, eval_callback, checkpoint_callback],
-        progress_bar    = True,
+        callback        = [log_callback, tb_callback, eval_callback, checkpoint_callback],
+        progress_bar    = True,   # requires `pip install rich`
     )
-
+ 
     model.save("ppo_franka_kitchen_final")
     print("\nModel saved → ppo_franka_kitchen_final.zip")
-
+ 
     vec_env.close()
     eval_env.close()
-
-    return log_callback.episode_returns
+ 
+    return log_callback
 
 
 # ─────────────────────────────────────────────
@@ -280,7 +344,7 @@ def evaluate(
     gym.register_envs(gymnasium_robotics)
 
     render_mode  = 'rgb_array' if record_video else 'human'
-    video_folder = "franka_kitchen_eval_videos"
+    video_folder = "franka_kitchen_eval_videos_parrallel"
 
     env = gym.make('FrankaKitchen-v1',
                    tasks_to_complete=TASKS,
@@ -322,8 +386,8 @@ def evaluate(
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
-    episode_returns = train()
-    plot_results(episode_returns)
+    # episode_returns = train(run_name="ppo_run_1")
+    # plot_results(episode_returns)
 
     # Uncomment to evaluate the final model after training:
-    # evaluate("/home/avid/robot_learning_project/ppo_franka_best/best_model.zip")
+    evaluate("/home/avid/robot_learning_project/ppo_franka_best/best_model.zip")
