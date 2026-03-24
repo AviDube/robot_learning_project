@@ -1,5 +1,6 @@
 absl-py==2.4.0
 asttokens==3.0.1
+box2d-py==2.3.5
 certifi==2026.1.4
 cffi==1.17.1
 charset-normalizer==3.4.4
@@ -36,9 +37,11 @@ jedi==0.19.2
 Jinja2==3.1.6
 kiwisolver==1.4.9
 Markdown==3.10.1
+markdown-it-py==4.0.0
 MarkupSafe==3.0.3
 matplotlib==3.9.4
 matplotlib-inline==0.2.1
+mdurl==0.1.2
 monotonic==1.6
 moviepy==2.2.1
 mpmath==1.3.0
@@ -64,6 +67,7 @@ nvidia-nvshmem-cu12==3.4.5
 nvidia-nvtx-cu12==12.8.90
 oauthlib==3.3.1
 packaging==26.0
+pandas==2.3.3
 parso==0.8.5
 pettingzoo==1.25.0
 pexpect==4.9.0
@@ -76,21 +80,26 @@ pure_eval==0.2.3
 pyasn1==0.6.2
 pyasn1_modules==0.4.2
 pycparser==3.0
+pygame==2.1.0
 Pygments==2.19.2
 PyOpenGL==3.1.10
 pyparsing==3.3.2
 python-dateutil==2.9.0.post0
 python-dotenv==1.2.1
+pytz==2026.1.post1
 PyVirtualDisplay==3.0
 requests==2.32.5
 requests-oauthlib==2.0.0
+rich==14.3.3
 -e git+https://github.com/AviDube/Robot-Learning-HW.git@9fd9116ccd822082aefb30af474c0be114043cde#egg=rob831&subdirectory=hw1
 rsa==4.9.1
 six==1.17.0
+stable_baselines3==2.7.1
 stack-data==0.6.3
 sympy==1.14.0
-tensorboard==2.10.0
-tensorboard-data-server==0.6.1
+tbparse==0.0.9
+tensorboard==2.20.0
+tensorboard-data-server==0.7.2
 tensorboard-plugin-wit==1.8.1
 tensorboardX==2.5.1
 torch==2.10.0
@@ -98,6 +107,7 @@ tqdm==4.67.3
 traitlets==5.14.3
 triton==3.6.0
 typing_extensions==4.15.0
+tzdata==2025.3
 urllib3==2.6.3
 wcwidth==0.5.3
 Werkzeug==3.1.5
