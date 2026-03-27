@@ -33,7 +33,7 @@ os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 ENV_ID = "FrankaKitchen-v1"
 TASKS = ["kettle"]
 
-TOTAL_TIMESTEPS = 5_000_000
+TOTAL_TIMESTEPS = 1_000_000
 N_ENVS = 8
 SEED = 42
 
