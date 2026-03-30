@@ -12,6 +12,7 @@ from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor, SubprocVecEnv
 from stable_baselines3.common.callbacks import BaseCallback, EvalCallback, CheckpointCallback
 from stable_baselines3.common.monitor import Monitor
+from kitchen_dense_reward import KitchenDenseRewardConfig, KitchenDenseRewardWrapper
 
 # ─────────────────────────────────────────────
 # OBSERVATION WRAPPER
@@ -95,6 +96,16 @@ class FlattenObsWrapper(gym.ObservationWrapper):
 
 TASKS = ['microwave', 'kettle']
 
+DENSE_REWARD_CONFIG = KitchenDenseRewardConfig(
+    goal_epsilon=0.3,
+    sparse_weight=1.0,
+    elementwise_weight=1.0,
+    distance_weight=0.2,
+    progress_weight=0.8,
+    action_penalty_weight=0.01,
+    time_penalty_weight=0.01,
+)
+
 def make_env(render_mode=None):
     """Creates and wraps a single Franka Kitchen env."""
     def _init():
@@ -104,6 +115,7 @@ def make_env(render_mode=None):
             tasks_to_complete=TASKS,
             render_mode=render_mode,
         )
+        env = KitchenDenseRewardWrapper(env, config=DENSE_REWARD_CONFIG)
         env = FlattenObsWrapper(env)
         env = Monitor(env)
         return env
@@ -349,6 +361,7 @@ def evaluate(
     env = gym.make('FrankaKitchen-v1',
                    tasks_to_complete=TASKS,
                    render_mode=render_mode)
+    env = KitchenDenseRewardWrapper(env, config=DENSE_REWARD_CONFIG)
     env = FlattenObsWrapper(env)
 
     if record_video:
@@ -386,8 +399,9 @@ def evaluate(
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # episode_returns = train(run_name="ppo_run_1")
-    # plot_results(episode_returns)
+    run_name = "ppo_run_1"
+    log_callback = train(run_name=run_name)
+    plot_results(log_callback.episode_returns)
 
     # Uncomment to evaluate the final model after training:
-    evaluate("/home/avid/robot_learning_project/ppo_franka_best/best_model.zip")
+    # evaluate("ppo_franka_kitchen_final", num_episodes=5, record_video=True)

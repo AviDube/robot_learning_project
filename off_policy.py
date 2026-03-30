@@ -15,6 +15,7 @@ from stable_baselines3.common.callbacks import (
     CallbackList,
     BaseCallback,
 )
+from kitchen_dense_reward import KitchenDenseRewardConfig, KitchenDenseRewardWrapper
 
 gym.register_envs(gymnasium_robotics)
 
@@ -32,6 +33,16 @@ os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
 ENV_ID = "FrankaKitchen-v1"
 TASKS = ["kettle"]
+
+DENSE_REWARD_CONFIG = KitchenDenseRewardConfig(
+    goal_epsilon=0.3,
+    sparse_weight=1.0,
+    elementwise_weight=1.0,
+    distance_weight=0.2,
+    progress_weight=0.8,
+    action_penalty_weight=0.01,
+    time_penalty_weight=0.01,
+)
 
 TOTAL_TIMESTEPS = 1_000_000
 N_ENVS = 8
@@ -119,7 +130,8 @@ class FlattenNestedDictWrapper(gym.ObservationWrapper):
                     new_spaces[key] = space
 
         self.observation_space = spaces.Dict(new_spaces)
-        self._goal_env = self.env.unwrapped
+        # Keep the wrapped env here so HER calls use our dense compute_reward().
+        self._goal_env = self.env
 
     def observation(self, observation):
         out = {}
@@ -208,6 +220,33 @@ class KitchenSuccessInfoWrapper(gym.Wrapper):
     def __init__(self, env: gym.Env):
         super().__init__(env)
 
+    def compute_reward(self, achieved_goal, desired_goal, info):
+        if hasattr(self.env, "compute_reward"):
+            return self.env.compute_reward(achieved_goal, desired_goal, info)
+        if hasattr(self.env.unwrapped, "compute_reward"):
+            return self.env.unwrapped.compute_reward(achieved_goal, desired_goal, info)
+        raise AttributeError(
+            f"Underlying env of type {type(self.env)} has no compute_reward()."
+        )
+
+    def compute_terminated(self, achieved_goal, desired_goal, info):
+        if hasattr(self.env, "compute_terminated"):
+            return self.env.compute_terminated(achieved_goal, desired_goal, info)
+        if hasattr(self.env.unwrapped, "compute_terminated"):
+            return self.env.unwrapped.compute_terminated(achieved_goal, desired_goal, info)
+        raise AttributeError(
+            f"Underlying env of type {type(self.env)} has no compute_terminated()."
+        )
+
+    def compute_truncated(self, achieved_goal, desired_goal, info):
+        if hasattr(self.env, "compute_truncated"):
+            return self.env.compute_truncated(achieved_goal, desired_goal, info)
+        if hasattr(self.env.unwrapped, "compute_truncated"):
+            return self.env.unwrapped.compute_truncated(achieved_goal, desired_goal, info)
+        raise AttributeError(
+            f"Underlying env of type {type(self.env)} has no compute_truncated()."
+        )
+
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
         done = terminated or truncated
@@ -227,6 +266,31 @@ class KitchenSuccessInfoWrapper(gym.Wrapper):
 # -------------------------------------------------
 # Logging callback
 # -------------------------------------------------
+class TrainingLogCallback(BaseCallback):
+    """
+    Logs mean episode return to console every `log_freq` timesteps.
+    VecMonitor/Monitor injects episode stats into info.
+    """
+
+    def __init__(self, log_freq: int = 2048, verbose: int = 1):
+        super().__init__(verbose)
+        self.log_freq = log_freq
+        self.episode_returns: list[float] = []
+
+    def _on_step(self) -> bool:
+        for info in self.locals.get("infos", []):
+            if "episode" in info:
+                self.episode_returns.append(float(info["episode"]["r"]))
+
+        if self.n_calls % self.log_freq == 0 and self.episode_returns:
+            mean_ret = np.mean(self.episode_returns[-20:])
+            print(
+                f"  Steps: {self.num_timesteps:>8,} | "
+                f"Mean Return (last 20 eps): {mean_ret:>8.3f}"
+            )
+        return True
+
+
 class InfoStatsCallback(BaseCallback):
     def __init__(self, verbose=0):
         super().__init__(verbose)
@@ -267,6 +331,7 @@ def make_env(rank: int, seed: int = 0):
             ENV_ID,
             tasks_to_complete=TASKS,
         )
+        env = KitchenDenseRewardWrapper(env, config=DENSE_REWARD_CONFIG)
         env = KitchenSuccessInfoWrapper(env)
         env = FlattenNestedDictWrapper(env)
         env.reset(seed=seed + rank)
@@ -321,6 +386,9 @@ def sanity_check_env():
 # -------------------------------------------------
 if __name__ == "__main__":
     sanity_check_env()
+    run_name = "sac_run_1"
+    print(f"Run: {run_name}")
+    print("Setting up vectorised environments…")
 
     # Parallel training envs
     train_env = SubprocVecEnv([make_env(rank=i, seed=SEED) for i in range(N_ENVS)])
@@ -346,9 +414,11 @@ if __name__ == "__main__":
         name_prefix="sac_franka",
     )
 
+    log_callback = TrainingLogCallback(log_freq=2048)
     info_stats_callback = InfoStatsCallback()
 
     callbacks = CallbackList([
+        log_callback,
         info_stats_callback,
         eval_callback,
         checkpoint_callback,
@@ -373,15 +443,18 @@ if __name__ == "__main__":
             copy_info_dict=True,
         ),
         tensorboard_log=TB_LOG_DIR,
-        verbose=1,
+        verbose=0,
         device="cuda",
         seed=SEED,
     )
 
+    print(f"\nPolicy architecture:\n{model.policy}\n")
+    print(f"Training for {TOTAL_TIMESTEPS:,} timesteps across {N_ENVS} parallel envs…\n")
+
     model.learn(
         total_timesteps=TOTAL_TIMESTEPS,
         callback=callbacks,
-        progress_bar=False,
+        progress_bar=True,  # requires `pip install rich`
     )
 
     model.save("sac_franka_final")
