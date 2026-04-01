@@ -94,16 +94,20 @@ class FlattenObsWrapper(gym.ObservationWrapper):
 # SB3 expects a callable that returns a fresh env.
 # ─────────────────────────────────────────────
 
-TASKS = ['microwave', 'kettle']
+TASKS = ["kettle"]
 
 DENSE_REWARD_CONFIG = KitchenDenseRewardConfig(
     goal_epsilon=0.3,
-    sparse_weight=1.0,
-    elementwise_weight=1.0,
-    distance_weight=0.2,
-    progress_weight=0.8,
-    action_penalty_weight=0.01,
-    time_penalty_weight=0.01,
+    success_bonus=100.0,
+    goal_distance_weight=8.0,
+    goal_proximity_weight=12.0,
+    goal_proximity_scale=0.25,
+    arm_distance_weight=0.3,
+    arm_distance_clip=0.7,
+    arm_gate_width=0.2,
+    action_penalty_weight=0.0,
+    time_penalty_weight=0.0,
+    success_task_name="kettle",
 )
 
 def make_env(render_mode=None):

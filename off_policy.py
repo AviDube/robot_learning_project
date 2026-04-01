@@ -7,7 +7,6 @@ import numpy as np
 from gymnasium import spaces
 
 from stable_baselines3 import SAC
-from stable_baselines3.her import HerReplayBuffer
 from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor, SubprocVecEnv
 from stable_baselines3.common.callbacks import (
     EvalCallback,
@@ -36,17 +35,22 @@ TASKS = ["kettle"]
 
 DENSE_REWARD_CONFIG = KitchenDenseRewardConfig(
     goal_epsilon=0.3,
-    sparse_weight=1.0,
-    elementwise_weight=1.0,
-    distance_weight=0.2,
-    progress_weight=0.8,
-    action_penalty_weight=0.01,
-    time_penalty_weight=0.01,
+    success_bonus=100.0,
+    goal_distance_weight=8.0,
+    goal_proximity_weight=12.0,
+    goal_proximity_scale=0.25,
+    arm_distance_weight=0.3,
+    arm_distance_clip=0.7,
+    arm_gate_width=0.2,
+    action_penalty_weight=0.0,
+    time_penalty_weight=0.0,
+    success_task_name="kettle",
 )
 
-TOTAL_TIMESTEPS = 1_000_000
+TOTAL_TIMESTEPS = 2_000_000
 N_ENVS = 8
 SEED = 42
+USE_HER = False
 
 
 # -------------------------------------------------
@@ -217,8 +221,10 @@ class FlattenNestedDictWrapper(gym.ObservationWrapper):
 # Success info wrapper (for EvalCallback success_rate)
 # -------------------------------------------------
 class KitchenSuccessInfoWrapper(gym.Wrapper):
-    def __init__(self, env: gym.Env):
+    def __init__(self, env: gym.Env, target_tasks=None):
         super().__init__(env)
+        tasks = target_tasks if target_tasks is not None else ["kettle"]
+        self._target_tasks = set(tasks)
 
     def compute_reward(self, achieved_goal, desired_goal, info):
         if hasattr(self.env, "compute_reward"):
@@ -252,13 +258,13 @@ class KitchenSuccessInfoWrapper(gym.Wrapper):
         done = terminated or truncated
 
         if done and "is_success" not in info:
-            completed = info.get("completed_tasks", [])
-            if isinstance(completed, (list, tuple, set)):
-                info["is_success"] = float("kettle" in completed)
+            remaining = info.get("tasks_to_complete", None)
+            if isinstance(remaining, (list, tuple, set)):
+                info["is_success"] = float(self._target_tasks.isdisjoint(set(remaining)))
             else:
-                remaining = info.get("tasks_to_complete", [])
-                if isinstance(remaining, (list, tuple, set)):
-                    info["is_success"] = float("kettle" not in remaining)
+                completed = info.get("completed_tasks", None)
+                if isinstance(completed, (list, tuple, set)):
+                    info["is_success"] = float(self._target_tasks.issubset(set(completed)))
 
         return obs, reward, terminated, truncated, info
 
@@ -322,6 +328,78 @@ class InfoStatsCallback(BaseCallback):
         return True
 
 
+class KitchenEvalCallback(EvalCallback):
+    """
+    Eval callback that also logs reward-component means from evaluation rollouts.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._eval_success_terms: list[float] = []
+        self._eval_goal_distance_terms: list[float] = []
+        self._eval_arm_distance_terms: list[float] = []
+
+    def _log_success_callback(self, locals_, globals_) -> None:
+        super()._log_success_callback(locals_, globals_)
+
+        info = locals_.get("info", None)
+        if not isinstance(info, dict):
+            return
+
+        components = info.get("reward_components", None)
+        if not isinstance(components, dict):
+            return
+
+        success_term = components.get("success", None)
+        goal_distance = components.get("goal_distance", None)
+        arm_distance = components.get("arm_distance", None)
+
+        if success_term is not None:
+            self._eval_success_terms.append(float(success_term))
+        if goal_distance is not None:
+            self._eval_goal_distance_terms.append(float(goal_distance))
+        if arm_distance is not None:
+            self._eval_arm_distance_terms.append(float(arm_distance))
+
+    def _on_step(self) -> bool:
+        is_eval_step = self.eval_freq > 0 and self.n_calls % self.eval_freq == 0
+        if is_eval_step:
+            self._eval_success_terms.clear()
+            self._eval_goal_distance_terms.clear()
+            self._eval_arm_distance_terms.clear()
+
+        continue_training = super()._on_step()
+
+        if is_eval_step:
+            success_mean = None
+            goal_distance_mean = None
+            arm_distance_mean = None
+            if self._eval_success_terms:
+                success_mean = float(np.mean(self._eval_success_terms))
+                self.logger.record("eval/reward_success_mean", success_mean)
+            if self._eval_goal_distance_terms:
+                goal_distance_mean = float(np.mean(self._eval_goal_distance_terms))
+                self.logger.record("eval/reward_goal_distance_mean", goal_distance_mean)
+            if self._eval_arm_distance_terms:
+                arm_distance_mean = float(np.mean(self._eval_arm_distance_terms))
+                self.logger.record("eval/reward_arm_distance_mean", arm_distance_mean)
+
+            if (
+                success_mean is not None
+                and goal_distance_mean is not None
+                and arm_distance_mean is not None
+            ):
+                print(
+                    "Eval reward components: "
+                    f"success={success_mean:.4f}, "
+                    f"goal_distance={goal_distance_mean:.4f}, "
+                    f"arm_distance={arm_distance_mean:.4f}"
+                )
+            self.logger.dump(self.num_timesteps)
+
+        return continue_training
+
+
 # -------------------------------------------------
 # Env factory
 # -------------------------------------------------
@@ -332,7 +410,7 @@ def make_env(rank: int, seed: int = 0):
             tasks_to_complete=TASKS,
         )
         env = KitchenDenseRewardWrapper(env, config=DENSE_REWARD_CONFIG)
-        env = KitchenSuccessInfoWrapper(env)
+        env = KitchenSuccessInfoWrapper(env, target_tasks=TASKS)
         env = FlattenNestedDictWrapper(env)
         env.reset(seed=seed + rank)
         return env
@@ -386,8 +464,9 @@ def sanity_check_env():
 # -------------------------------------------------
 if __name__ == "__main__":
     sanity_check_env()
-    run_name = "sac_run_1"
+    run_name = "sac_dense_no_her"
     print(f"Run: {run_name}")
+    print(f"HER enabled: {USE_HER}")
     print("Setting up vectorised environments…")
 
     # Parallel training envs
@@ -398,12 +477,12 @@ if __name__ == "__main__":
     eval_env = DummyVecEnv([make_env(rank=10_000, seed=SEED)])
     eval_env = VecMonitor(eval_env)
 
-    eval_callback = EvalCallback(
+    eval_callback = KitchenEvalCallback(
         eval_env=eval_env,
         best_model_save_path=BEST_MODEL_DIR,
         log_path=LOG_DIR,
-        eval_freq=max(10_000 // N_ENVS, 1),
-        n_eval_episodes=10,
+        eval_freq=max(20_000 // N_ENVS, 1),
+        n_eval_episodes=20,
         deterministic=True,
         render=False,
     )
@@ -429,22 +508,16 @@ if __name__ == "__main__":
         env=train_env,
         learning_rate=3e-4,
         buffer_size=1_000_000,
-        learning_starts=100_000,
-        batch_size=512,
+        learning_starts=50_000,
+        batch_size=256,
         tau=0.005,
         gamma=0.99,
         train_freq=1,
-        gradient_steps=8,
+        gradient_steps=2,
         ent_coef="auto",
-        replay_buffer_class=HerReplayBuffer,
-        replay_buffer_kwargs=dict(
-            n_sampled_goal=8,
-            goal_selection_strategy="future",
-            copy_info_dict=True,
-        ),
         tensorboard_log=TB_LOG_DIR,
         verbose=0,
-        device="cuda",
+        device="auto",
         seed=SEED,
     )
 
