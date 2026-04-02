@@ -98,17 +98,43 @@ TASKS = ["kettle"]
 
 DENSE_REWARD_CONFIG = KitchenDenseRewardConfig(
     goal_epsilon=0.3,
-    success_bonus=100.0,
-    goal_distance_weight=8.0,
-    goal_proximity_weight=12.0,
-    goal_proximity_scale=0.25,
-    arm_distance_weight=0.3,
+    success_bonus=150.0,
+    goal_distance_weight=10.0,
+    goal_progress_weight=30.0,
+    goal_progress_clip=0.05,
+    arm_distance_weight=0.15,
     arm_distance_clip=0.7,
-    arm_gate_width=0.2,
+    arm_gate_width=0.25,
+    arm_progress_weight=2.0,
+    arm_progress_clip=0.05,
     action_penalty_weight=0.0,
-    time_penalty_weight=0.0,
+    time_penalty_weight=0.02,
+    timeout_failure_penalty=40.0,
     success_task_name="kettle",
 )
+
+
+class KitchenSuccessInfoWrapper(gym.Wrapper):
+    def __init__(self, env: gym.Env, target_tasks=None):
+        super().__init__(env)
+        tasks = target_tasks if target_tasks is not None else ["kettle"]
+        self._target_tasks = set(tasks)
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        done = terminated or truncated
+
+        if done and "is_success" not in info:
+            remaining = info.get("tasks_to_complete", None)
+            if isinstance(remaining, (list, tuple, set)):
+                info["is_success"] = float(self._target_tasks.isdisjoint(set(remaining)))
+            else:
+                completed = info.get("completed_tasks", None)
+                if isinstance(completed, (list, tuple, set)):
+                    info["is_success"] = float(self._target_tasks.issubset(set(completed)))
+
+        return obs, reward, terminated, truncated, info
+
 
 def make_env(render_mode=None):
     """Creates and wraps a single Franka Kitchen env."""
@@ -120,6 +146,7 @@ def make_env(render_mode=None):
             render_mode=render_mode,
         )
         env = KitchenDenseRewardWrapper(env, config=DENSE_REWARD_CONFIG)
+        env = KitchenSuccessInfoWrapper(env, target_tasks=TASKS)
         env = FlattenObsWrapper(env)
         env = Monitor(env)
         return env
@@ -206,6 +233,140 @@ class TrainingLogCallback(BaseCallback):
             )
         return True
 
+
+class InfoStatsCallback(BaseCallback):
+    def __init__(self, verbose=0):
+        super().__init__(verbose)
+
+    def _on_step(self) -> bool:
+        infos = self.locals.get("infos", [])
+        if not infos:
+            return True
+
+        success_vals = []
+        for info in infos:
+            if "is_success" in info:
+                success_vals.append(float(info["is_success"]))
+
+        if success_vals:
+            self.logger.record("rollout/is_success_mean", float(np.mean(success_vals)))
+        return True
+
+
+class KitchenEvalCallback(EvalCallback):
+    """
+    Eval callback that logs reward components and saves best model by success rate.
+    Tie-breaker: mean reward.
+    """
+
+    def __init__(self, *args, best_model_dir: str, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.best_model_dir = best_model_dir
+        os.makedirs(self.best_model_dir, exist_ok=True)
+        self.best_success_rate = -np.inf
+        self.best_success_mean_reward = -np.inf
+        self.best_success_model_path = os.path.join(self.best_model_dir, "best_model.zip")
+        self._eval_success_terms: list[float] = []
+        self._eval_goal_distance_terms: list[float] = []
+        self._eval_arm_distance_terms: list[float] = []
+
+    def _log_success_callback(self, locals_, globals_) -> None:
+        super()._log_success_callback(locals_, globals_)
+
+        info = locals_.get("info", None)
+        if not isinstance(info, dict):
+            return
+
+        components = info.get("reward_components", None)
+        if not isinstance(components, dict):
+            return
+
+        success_term = components.get("success", None)
+        goal_distance = components.get("goal_distance", None)
+        arm_distance = components.get("arm_distance", None)
+
+        if success_term is not None:
+            self._eval_success_terms.append(float(success_term))
+        if goal_distance is not None:
+            self._eval_goal_distance_terms.append(float(goal_distance))
+        if arm_distance is not None:
+            self._eval_arm_distance_terms.append(float(arm_distance))
+
+    def _on_step(self) -> bool:
+        is_eval_step = self.eval_freq > 0 and self.n_calls % self.eval_freq == 0
+        if is_eval_step:
+            self._eval_success_terms.clear()
+            self._eval_goal_distance_terms.clear()
+            self._eval_arm_distance_terms.clear()
+
+        continue_training = super()._on_step()
+
+        if is_eval_step:
+            curr_success = None
+            last_success_rate = getattr(self, "last_success_rate", None)
+            if last_success_rate is not None:
+                curr_success = float(last_success_rate)
+
+            if curr_success is None:
+                success_buffer = getattr(self, "_is_success_buffer", None)
+                if isinstance(success_buffer, (list, tuple, np.ndarray)) and len(success_buffer) > 0:
+                    curr_success = float(np.mean(success_buffer))
+
+            if curr_success is None:
+                evaluations_successes = getattr(self, "evaluations_successes", None)
+                if evaluations_successes is not None and len(evaluations_successes) > 0:
+                    last_eval_successes = np.asarray(evaluations_successes[-1], dtype=np.float32).reshape(-1)
+                    if last_eval_successes.size > 0:
+                        curr_success = float(np.mean(last_eval_successes))
+
+            if curr_success is None:
+                curr_success = 0.0
+
+            curr_mean_reward = float(getattr(self, "last_mean_reward", -np.inf))
+            improved = (
+                curr_success > self.best_success_rate
+                or (
+                    np.isclose(curr_success, self.best_success_rate)
+                    and curr_mean_reward > self.best_success_mean_reward
+                )
+            )
+            if improved and self.model is not None:
+                self.best_success_rate = curr_success
+                self.best_success_mean_reward = curr_mean_reward
+                self.model.save(self.best_success_model_path)
+                print(
+                    "New best model (by success): "
+                    f"success={curr_success:.2%}, mean_reward={curr_mean_reward:.2f}"
+                )
+
+            success_mean = None
+            goal_distance_mean = None
+            arm_distance_mean = None
+            if self._eval_success_terms:
+                success_mean = float(np.mean(self._eval_success_terms))
+                self.logger.record("eval/reward_success_mean", success_mean)
+            if self._eval_goal_distance_terms:
+                goal_distance_mean = float(np.mean(self._eval_goal_distance_terms))
+                self.logger.record("eval/reward_goal_distance_mean", goal_distance_mean)
+            if self._eval_arm_distance_terms:
+                arm_distance_mean = float(np.mean(self._eval_arm_distance_terms))
+                self.logger.record("eval/reward_arm_distance_mean", arm_distance_mean)
+
+            if (
+                success_mean is not None
+                and goal_distance_mean is not None
+                and arm_distance_mean is not None
+            ):
+                print(
+                    "Eval reward components: "
+                    f"success={success_mean:.4f}, "
+                    f"goal_distance={goal_distance_mean:.4f}, "
+                    f"arm_distance={arm_distance_mean:.4f}"
+                )
+            self.logger.dump(self.num_timesteps)
+
+        return continue_training
+
 TOTAL_TIMESTEPS = 2_000_000
  
 # ── Parallel env scaling for RTX 5090 ────────────────────────────────────────
@@ -270,12 +431,14 @@ def train(run_name: str = "ppo_run_1"):
  
     # ── Callbacks ─────────────────────────────────────────────────────────────
     log_callback = TrainingLogCallback(log_freq=2048)
+    info_stats_callback = InfoStatsCallback()
  
     tb_callback  = TensorboardCallback(log_freq=10_000, run_name=run_name)
  
-    eval_callback = EvalCallback(
+    eval_callback = KitchenEvalCallback(
         eval_env,
-        best_model_save_path = "./ppo_franka_best/",
+        best_model_save_path = None,
+        best_model_dir       = "./ppo_franka_best/",
         log_path             = "./ppo_franka_eval_logs/",
         eval_freq            = 10_000,   # evaluate every N timesteps
         n_eval_episodes      = 5,
@@ -302,7 +465,7 @@ def train(run_name: str = "ppo_run_1"):
  
     model.learn(
         total_timesteps = TOTAL_TIMESTEPS,
-        callback        = [log_callback, tb_callback, eval_callback, checkpoint_callback],
+        callback        = [log_callback, info_stats_callback, tb_callback, eval_callback, checkpoint_callback],
         progress_bar    = True,   # requires `pip install rich`
     )
  

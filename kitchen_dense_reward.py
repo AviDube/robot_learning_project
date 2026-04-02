@@ -10,15 +10,18 @@ import numpy as np
 @dataclass(frozen=True)
 class KitchenDenseRewardConfig:
     goal_epsilon: float = 0.3
-    success_bonus: float = 100.0
-    goal_distance_weight: float = 8.0
-    goal_proximity_weight: float = 12.0
-    goal_proximity_scale: float = 0.25
-    arm_distance_weight: float = 0.3
+    success_bonus: float = 150.0
+    goal_distance_weight: float = 10.0
+    goal_progress_weight: float = 30.0
+    goal_progress_clip: float = 0.05
+    arm_distance_weight: float = 0.15
     arm_distance_clip: float = 0.7
-    arm_gate_width: float = 0.2
+    arm_gate_width: float = 0.25
+    arm_progress_weight: float = 2.0
+    arm_progress_clip: float = 0.05
     action_penalty_weight: float = 0.001
-    time_penalty_weight: float = 0.0
+    time_penalty_weight: float = 0.02
+    timeout_failure_penalty: float = 40.0
     success_task_name: str = "kettle"
     ee_name_keywords: Tuple[str, ...] = (
         "end_effector",
@@ -104,11 +107,13 @@ class KitchenDenseRewardWrapper(gym.Wrapper):
 
     Reward terms:
       + success bonus when task is solved
-      + smooth goal-proximity bonus exp(-d_goal / scale)
       - distance between achieved and desired goal states
+      + progress in achieved/desired goal distance (delta over previous step)
       - gated distance between end-effector and kettle
+      + progress in end-effector-to-kettle distance (small)
       - action magnitude penalty
       - small time penalty
+      - timeout penalty when episode truncates without success
 
     HER safety:
       compute_reward() must not depend on the wrapper's live simulator state.
@@ -121,9 +126,17 @@ class KitchenDenseRewardWrapper(gym.Wrapper):
         self._refs_resolved = False
         self._ee_ref: Tuple[str, str] | None = None
         self._kettle_ref: Tuple[str, str] | None = None
+        self._prev_goal_distance: float | None = None
+        self._prev_arm_distance: float | None = None
 
     def reset(self, **kwargs):
-        return self.env.reset(**kwargs)
+        obs, info = self.env.reset(**kwargs)
+        if isinstance(obs, dict) and "achieved_goal" in obs and "desired_goal" in obs:
+            self._prev_goal_distance = _goal_distance(obs["achieved_goal"], obs["desired_goal"])
+        else:
+            self._prev_goal_distance = None
+        self._prev_arm_distance = self._ee_to_kettle_distance()
+        return obs, info
 
     def _get_model_data(self):
         base = self.env.unwrapped if hasattr(self.env, "unwrapped") else self.env
@@ -292,6 +305,28 @@ class KitchenDenseRewardWrapper(gym.Wrapper):
         except Exception:
             return None
 
+    @staticmethod
+    def _prev_goal_distance_from_info(info: Any) -> float | None:
+        if not isinstance(info, dict):
+            return None
+        if "prev_goal_distance" not in info:
+            return None
+        try:
+            return float(info["prev_goal_distance"])
+        except Exception:
+            return None
+
+    @staticmethod
+    def _prev_arm_distance_from_info(info: Any) -> float | None:
+        if not isinstance(info, dict):
+            return None
+        if "prev_arm_distance" not in info:
+            return None
+        try:
+            return float(info["prev_arm_distance"])
+        except Exception:
+            return None
+
     def _compute_reward_single(
         self,
         achieved_goal: Any,
@@ -305,8 +340,14 @@ class KitchenDenseRewardWrapper(gym.Wrapper):
         goal_dist = _goal_distance(achieved_goal, desired_goal)
         # HER-safe success: recomputed from current (achieved_goal, desired_goal).
         success_term = float(goal_dist < cfg.goal_epsilon)
-        proximity_scale = max(float(cfg.goal_proximity_scale), 1e-6)
-        goal_proximity = float(np.exp(-goal_dist / proximity_scale))
+
+        prev_goal_dist = self._prev_goal_distance_from_info(info)
+        goal_progress = 0.0
+        if prev_goal_dist is not None:
+            goal_progress = prev_goal_dist - goal_dist
+        goal_progress = float(
+            np.clip(goal_progress, -float(cfg.goal_progress_clip), float(cfg.goal_progress_clip))
+        )
 
         # HER-safe arm shaping: use transition-local info only.
         ee_kettle_dist = self._arm_distance_from_info(info)
@@ -322,25 +363,42 @@ class KitchenDenseRewardWrapper(gym.Wrapper):
         arm_dist_term = min(arm_dist_raw, float(cfg.arm_distance_clip))
         arm_gate_width = max(float(cfg.arm_gate_width), 1e-6)
         arm_gate = float(np.clip((goal_dist - cfg.goal_epsilon) / arm_gate_width, 0.0, 1.0))
+        prev_arm_dist = self._prev_arm_distance_from_info(info)
+        arm_progress = 0.0
+        if prev_arm_dist is not None:
+            arm_progress = prev_arm_dist - arm_dist_raw
+        arm_progress = float(
+            np.clip(arm_progress, -float(cfg.arm_progress_clip), float(cfg.arm_progress_clip))
+        )
+
+        timeout_failure = 0.0
+        if isinstance(info, dict):
+            is_timeout = bool(info.get("is_timeout", False))
+            if is_timeout and success_term < 0.5:
+                timeout_failure = 1.0
 
         reward = (
             cfg.success_bonus * float(success_term)
-            + cfg.goal_proximity_weight * goal_proximity
             - cfg.goal_distance_weight * goal_dist
+            + cfg.goal_progress_weight * goal_progress
             - cfg.arm_distance_weight * arm_gate * arm_dist_term
+            + cfg.arm_progress_weight * arm_progress
             - cfg.action_penalty_weight * action_penalty
             - cfg.time_penalty_weight
+            - cfg.timeout_failure_penalty * timeout_failure
         )
 
         components = {
             "success": float(success_term),
             "goal_distance": float(goal_dist),
-            "goal_proximity": float(goal_proximity),
+            "goal_progress": float(goal_progress),
             "arm_distance": float(arm_dist_term),
             "arm_distance_raw": float(arm_dist_raw),
             "arm_gate": float(arm_gate),
+            "arm_progress": float(arm_progress),
             "action_penalty": float(action_penalty),
-            "time_penalty": 1.0,
+            "time_penalty": float(cfg.time_penalty_weight),
+            "timeout_failure": float(timeout_failure),
             "total": float(reward),
         }
         return float(reward), components
@@ -357,6 +415,11 @@ class KitchenDenseRewardWrapper(gym.Wrapper):
         ee_kettle_dist = self._ee_to_kettle_distance()
         if ee_kettle_dist is not None:
             info["ee_to_kettle_distance"] = float(ee_kettle_dist)
+        if self._prev_goal_distance is not None:
+            info["prev_goal_distance"] = float(self._prev_goal_distance)
+        if self._prev_arm_distance is not None:
+            info["prev_arm_distance"] = float(self._prev_arm_distance)
+        info["is_timeout"] = bool(truncated and not terminated)
         info["action"] = np.asarray(action, dtype=np.float32).copy()
 
         reward, components = self._compute_reward_single(
@@ -370,6 +433,9 @@ class KitchenDenseRewardWrapper(gym.Wrapper):
         info["reward_components"] = components
         info["dense_reward"] = reward
         info["sparse_reward"] = components["success"]
+
+        self._prev_goal_distance = components["goal_distance"]
+        self._prev_arm_distance = components["arm_distance_raw"]
 
         return obs, reward, terminated, truncated, info
 

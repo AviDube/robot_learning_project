@@ -36,15 +36,18 @@ TASKS = ["kettle"]
 
 DENSE_REWARD_CONFIG = KitchenDenseRewardConfig(
     goal_epsilon=0.3,
-    success_bonus=100.0,
-    goal_distance_weight=8.0,
-    goal_proximity_weight=12.0,
-    goal_proximity_scale=0.25,
-    arm_distance_weight=0.3,
+    success_bonus=150.0,
+    goal_distance_weight=10.0,
+    goal_progress_weight=30.0,
+    goal_progress_clip=0.05,
+    arm_distance_weight=0.15,
     arm_distance_clip=0.7,
-    arm_gate_width=0.2,
+    arm_gate_width=0.25,
+    arm_progress_weight=2.0,
+    arm_progress_clip=0.05,
     action_penalty_weight=0.0,
-    time_penalty_weight=0.0,
+    time_penalty_weight=0.02,
+    timeout_failure_penalty=40.0,
     success_task_name="kettle",
 )
 
