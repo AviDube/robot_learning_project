@@ -1,3 +1,4 @@
+import argparse
 import os
 from typing import Any, Dict, Tuple
 
@@ -330,11 +331,17 @@ class InfoStatsCallback(BaseCallback):
 
 class KitchenEvalCallback(EvalCallback):
     """
-    Eval callback that also logs reward-component means from evaluation rollouts.
+    Eval callback that logs reward components and saves best model by success rate.
+    Tie-breaker: mean reward.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, best_model_dir: str, **kwargs):
         super().__init__(*args, **kwargs)
+        self.best_model_dir = best_model_dir
+        os.makedirs(self.best_model_dir, exist_ok=True)
+        self.best_success_rate = -np.inf
+        self.best_success_mean_reward = -np.inf
+        self.best_success_model_path = os.path.join(self.best_model_dir, "best_model.zip")
         self._eval_success_terms: list[float] = []
         self._eval_goal_distance_terms: list[float] = []
         self._eval_arm_distance_terms: list[float] = []
@@ -371,6 +378,44 @@ class KitchenEvalCallback(EvalCallback):
         continue_training = super()._on_step()
 
         if is_eval_step:
+            # Save best model based on success first, then mean reward.
+            curr_success = None
+            last_success_rate = getattr(self, "last_success_rate", None)
+            if last_success_rate is not None:
+                curr_success = float(last_success_rate)
+
+            if curr_success is None:
+                success_buffer = getattr(self, "_is_success_buffer", None)
+                if isinstance(success_buffer, (list, tuple, np.ndarray)) and len(success_buffer) > 0:
+                    curr_success = float(np.mean(success_buffer))
+
+            if curr_success is None:
+                evaluations_successes = getattr(self, "evaluations_successes", None)
+                if evaluations_successes is not None and len(evaluations_successes) > 0:
+                    last_eval_successes = np.asarray(evaluations_successes[-1], dtype=np.float32).reshape(-1)
+                    if last_eval_successes.size > 0:
+                        curr_success = float(np.mean(last_eval_successes))
+
+            if curr_success is None:
+                curr_success = 0.0
+
+            curr_mean_reward = float(getattr(self, "last_mean_reward", -np.inf))
+            improved = (
+                curr_success > self.best_success_rate
+                or (
+                    np.isclose(curr_success, self.best_success_rate)
+                    and curr_mean_reward > self.best_success_mean_reward
+                )
+            )
+            if improved and self.model is not None:
+                self.best_success_rate = curr_success
+                self.best_success_mean_reward = curr_mean_reward
+                self.model.save(self.best_success_model_path)
+                print(
+                    "New best model (by success): "
+                    f"success={curr_success:.2%}, mean_reward={curr_mean_reward:.2f}"
+                )
+
             success_mean = None
             goal_distance_mean = None
             arm_distance_mean = None
@@ -398,6 +443,36 @@ class KitchenEvalCallback(EvalCallback):
             self.logger.dump(self.num_timesteps)
 
         return continue_training
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Train SAC on Franka Kitchen with dense reward and success-first model selection."
+    )
+    parser.add_argument(
+        "--resume-from",
+        type=str,
+        default=None,
+        help="Path to a SAC .zip checkpoint to continue training from.",
+    )
+    parser.add_argument(
+        "--total-timesteps",
+        type=int,
+        default=TOTAL_TIMESTEPS,
+        help="Number of timesteps to train in this invocation.",
+    )
+    parser.add_argument(
+        "--run-name",
+        type=str,
+        default="sac_dense_no_her",
+        help="Run label shown in stdout.",
+    )
+    parser.add_argument(
+        "--skip-sanity-check",
+        action="store_true",
+        help="Skip one-step environment sanity checks at startup.",
+    )
+    return parser.parse_args()
 
 
 # -------------------------------------------------
@@ -463,8 +538,11 @@ def sanity_check_env():
 # Main
 # -------------------------------------------------
 if __name__ == "__main__":
-    sanity_check_env()
-    run_name = "sac_dense_no_her"
+    args = parse_args()
+    if not args.skip_sanity_check:
+        sanity_check_env()
+
+    run_name = args.run_name
     print(f"Run: {run_name}")
     print(f"HER enabled: {USE_HER}")
     print("Setting up vectorised environments…")
@@ -479,7 +557,8 @@ if __name__ == "__main__":
 
     eval_callback = KitchenEvalCallback(
         eval_env=eval_env,
-        best_model_save_path=BEST_MODEL_DIR,
+        best_model_save_path=None,
+        best_model_dir=BEST_MODEL_DIR,
         log_path=LOG_DIR,
         eval_freq=max(20_000 // N_ENVS, 1),
         n_eval_episodes=20,
@@ -491,6 +570,7 @@ if __name__ == "__main__":
         save_freq=max(50_000 // N_ENVS, 1),
         save_path=CHECKPOINT_DIR,
         name_prefix="sac_franka",
+        save_replay_buffer=True,
     )
 
     log_callback = TrainingLogCallback(log_freq=2048)
@@ -503,30 +583,52 @@ if __name__ == "__main__":
         checkpoint_callback,
     ])
 
-    model = SAC(
-        policy="MultiInputPolicy",
-        env=train_env,
-        learning_rate=3e-4,
-        buffer_size=1_000_000,
-        learning_starts=50_000,
-        batch_size=256,
-        tau=0.005,
-        gamma=0.99,
-        train_freq=1,
-        gradient_steps=2,
-        ent_coef="auto",
-        tensorboard_log=TB_LOG_DIR,
-        verbose=0,
-        device="auto",
-        seed=SEED,
-    )
+    reset_num_timesteps = True
+    if args.resume_from:
+        if not os.path.isfile(args.resume_from):
+            raise FileNotFoundError(f"Checkpoint not found: {args.resume_from}")
+        print(f"Resuming from checkpoint: {args.resume_from}")
+        model = SAC.load(
+            args.resume_from,
+            env=train_env,
+            device="auto",
+            seed=SEED,
+        )
+        model.tensorboard_log = TB_LOG_DIR
+        reset_num_timesteps = False
+
+        replay_buffer_path = args.resume_from.replace(".zip", "_replay_buffer.pkl")
+        if os.path.isfile(replay_buffer_path):
+            model.load_replay_buffer(replay_buffer_path)
+            print(f"Loaded replay buffer: {replay_buffer_path}")
+        else:
+            print("Replay buffer file not found next to checkpoint; continuing without it.")
+    else:
+        model = SAC(
+            policy="MultiInputPolicy",
+            env=train_env,
+            learning_rate=3e-4,
+            buffer_size=1_000_000,
+            learning_starts=50_000,
+            batch_size=256,
+            tau=0.005,
+            gamma=0.99,
+            train_freq=1,
+            gradient_steps=2,
+            ent_coef="auto",
+            tensorboard_log=TB_LOG_DIR,
+            verbose=0,
+            device="auto",
+            seed=SEED,
+        )
 
     print(f"\nPolicy architecture:\n{model.policy}\n")
-    print(f"Training for {TOTAL_TIMESTEPS:,} timesteps across {N_ENVS} parallel envs…\n")
+    print(f"Training for {args.total_timesteps:,} timesteps across {N_ENVS} parallel envs…\n")
 
     model.learn(
-        total_timesteps=TOTAL_TIMESTEPS,
+        total_timesteps=args.total_timesteps,
         callback=callbacks,
+        reset_num_timesteps=reset_num_timesteps,
         progress_bar=True,  # requires `pip install rich`
     )
 
