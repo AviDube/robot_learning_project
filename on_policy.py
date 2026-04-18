@@ -1,12 +1,17 @@
+import argparse
+
 import gymnasium as gym
 import gymnasium_robotics
+import mujoco
 import numpy as np
 import os
 import matplotlib.pyplot as plt
 
 from gymnasium.wrappers import RecordVideo
 from gymnasium.spaces import Box
+from collections import defaultdict
 
+from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor, SubprocVecEnv
 from stable_baselines3.common.callbacks import BaseCallback, EvalCallback, CheckpointCallback
@@ -99,7 +104,7 @@ TASK_GOALS = {
 }
 
 # Tasks the agent must complete — must match gym.make() tasks_to_complete
-TASKS = ['microwave', 'kettle']
+TASKS = ['kettle']
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -198,20 +203,20 @@ class DenseRewardWrapper(gym.Wrapper):
     """
 
     # ── Shared weights ────────────────────────────────────────────────────────
-    W_DISTANCE       = 0.2    # gentle always-on distance signal
-    W_PROGRESS       = 1.0    # delta-distance (non-gated, applies to microwave too)
-    COMPLETION_BONUS = 2.0    # stacked on env's +1
+    W_DISTANCE       = 0.0      # Zeroed out to prevent passive hover-farming
+    W_PROGRESS       = 1.0      # delta-distance (non-gated, applies to microwave too)
+    COMPLETION_BONUS = 150.0    # Massive jackpot for finishing the task
+    TIME_PENALTY     = -0.01    # Bleeds points every step to force speed
 
     # ── Kettle-specific weights ───────────────────────────────────────────────
-    W_APPROACH       = 1.0    # EE→kettle continuous approach reward
-    APPROACH_THRESH  = 0.20   # metres — start earning approach reward inside this
-    W_GRASP          = 1.5    # gripper closure reward magnitude
-    GRASP_K          = 30.0   # exponential sharpness (higher = more binary signal)
-    W_LIFT           = 1.0    # reward per step kettle is above lift threshold
-    W_TRANSPORT      = 3.0    # gated transport-to-goal reward (replaces W_PROGRESS for kettle)
-    W_PUSH_PENALTY   = 2.0    # penalty magnitude for open-gripper horizontal motion
-    PUSH_MOVE_THRESH = 0.003  # metres/step — minimum xy movement to trigger penalty
-    PUSH_OPEN_THRESH = 0.04   # metres — gripper gap above which gripper counts as "open"
+    W_APPROACH       = 20.0     # Scaled up for the high-water mark delta progress
+    APPROACH_THRESH  = 0.20     # metres — start earning approach reward inside this
+    BONUS_GRASP      = 10.0     # Changed from W_GRASP: Now a one-time milestone payout
+    BONUS_LIFT       = 15.0     # Changed from W_LIFT: Now a one-time milestone payout
+    W_TRANSPORT      = 15.0     # Gated transport-to-goal reward (high value)
+    W_PUSH_PENALTY   = 2.0      # penalty magnitude for open-gripper horizontal motion
+    PUSH_MOVE_THRESH = 0.003    # metres/step — minimum xy movement to trigger penalty
+    PUSH_OPEN_THRESH = 0.04     # metres — gripper gap above which counts as "open"
     # ─────────────────────────────────────────────────────────────────────────
 
     def __init__(self, env, tasks: list[str] = TASKS):
@@ -221,25 +226,49 @@ class DenseRewardWrapper(gym.Wrapper):
             raise ValueError(f"None of {tasks} found in TASK_GOALS.")
 
         # Per-episode state
-        self._prev_dist:       dict[str, float] = {}
-        self._task_done:       dict[str, bool]  = {}
+        self._prev_dist:       dict[str, float]  = {}
+        self._task_done:       dict[str, bool]   = {}
         self._prev_kettle_xy:  np.ndarray | None = None
+        self._prev_kettle_xyz: np.ndarray | None = None
+        
+        # Anti-exploit trackers
+        self._min_ee_to_kettle: float = float('inf')
+        self._has_grasped:      bool  = False
+        self._has_lifted:       bool  = False
 
-    # ── MuJoCo helpers ────────────────────────────────────────────────────────
+        _model = self.env.unwrapped.model
+        self._kettle_bodies = {
+            mujoco.mj_name2id(_model, mujoco.mjtObj.mjOBJ_BODY, name)
+            for name in ('kettle', 'kettleroot')
+        } - {-1}
+        self._finger_bodies = {
+            mujoco.mj_name2id(_model, mujoco.mjtObj.mjOBJ_BODY, name)
+            for name in ('panda0_leftfinger', 'panda0_rightfinger')
+        } - {-1}
+
+    # ── MuJoCo & Obs helpers (unchanged) ──────────────────────────────────────
 
     def _ee_xyz(self) -> np.ndarray | None:
-        """Read end-effector world position from MuJoCo site data."""
         try:
-            uid = self.env.unwrapped.model.site('end_effector').id
-            return self.env.unwrapped.data.site_xpos[uid].copy()
-        except Exception:
+            model = self.env.unwrapped.model
+            data = self.env.unwrapped.data
+            
+            # Use the correct DeepMind MuJoCo binding syntax to get the site ID
+            uid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, 'end_effector')
+            
+            if uid == -1: # mj_name2id returns -1 if it can't find the name
+                return None
+                
+            return data.site_xpos[uid].copy()
+            
+        except Exception as e:
+            if not hasattr(self, '_warned_ee'):
+                print(f"\nCRITICAL ERROR tracking EE: {e}\n")
+                self._warned_ee = True
             return None
-
-    # ── Obs helpers ───────────────────────────────────────────────────────────
 
     @staticmethod
     def _gripper_gap(raw_obs: np.ndarray) -> float:
-        """Total gripper opening in metres (0 = fully closed)."""
         return float(raw_obs[_GRIPPER_R_IDX] + raw_obs[_GRIPPER_L_IDX])
 
     @staticmethod
@@ -251,6 +280,46 @@ class DenseRewardWrapper(gym.Wrapper):
         return float(np.linalg.norm(
             raw_obs[cfg["obs_indices"]].astype(np.float32) - cfg["goal"]
         ))
+    
+    def _is_touching_kettle(self) -> bool:
+        try:
+            model = self.env.unwrapped.model
+            data = self.env.unwrapped.data
+
+            if not self._kettle_bodies or not self._finger_bodies:
+                return False
+
+            for i in range(data.ncon):
+                contact = data.contact[i]
+                body1 = model.geom_bodyid[contact.geom1]
+                body2 = model.geom_bodyid[contact.geom2]
+                if {body1, body2} & self._kettle_bodies and {body1, body2} & self._finger_bodies:
+                    return True
+
+            return False
+
+        except Exception as e:
+            if not hasattr(self, '_warned_contact_err'):
+                print(f"\nCRITICAL ERROR in contact check: {e}\n")
+                self._warned_contact_err = True
+            return False
+        
+    def _kettle_handle_xyz(self) -> np.ndarray | None:
+        """Dynamically tracks the exact 3D position of the kettle's handle."""
+        try:
+            model = self.env.unwrapped.model
+            data = self.env.unwrapped.data
+            
+            # Use DeepMind MuJoCo bindings to find the kettle_site
+            uid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, 'kettle_site')
+            
+            if uid == -1:
+                return None
+                
+            return data.site_xpos[uid].copy()
+            
+        except Exception:
+            return None
 
     # ── Episode reset ─────────────────────────────────────────────────────────
 
@@ -260,7 +329,16 @@ class DenseRewardWrapper(gym.Wrapper):
         for task in self.tasks:
             self._prev_dist[task] = self._task_distance(raw_obs, task)
             self._task_done[task] = False
+            
         self._prev_kettle_xy = self._kettle_xyz(raw_obs)[:2].copy()
+        self._prev_kettle_xyz = self._kettle_xyz(raw_obs).copy()
+        self._initial_kettle_z = float(self._kettle_xyz(raw_obs)[2])
+        
+        # Reset anti-exploit trackers for the new episode
+        self._min_ee_to_kettle = float('inf')
+        self._has_grasped      = False
+        self._has_lifted       = False         
+        
         return obs, info
 
     # ── Step ──────────────────────────────────────────────────────────────────
@@ -270,7 +348,11 @@ class DenseRewardWrapper(gym.Wrapper):
         raw_obs = obs["observation"]
 
         shaped = 0.0
-        log    = {}   # per-component breakdown for TensorBoard
+        log    = {}   
+
+        # 0. The Time Penalty (Always active)
+        shaped += self.TIME_PENALTY
+        log["time_penalty"] = self.TIME_PENALTY
 
         kettle_xyz  = self._kettle_xyz(raw_obs)
         gripper_gap = self._gripper_gap(raw_obs)
@@ -291,11 +373,12 @@ class DenseRewardWrapper(gym.Wrapper):
                 self._task_done[task] = True
                 log[f"completion_{task}"] = self.COMPLETION_BONUS
 
-            # 2. Normalised distance (non-gated — applies to both tasks)
-            norm_dist = curr_dist / max(max_dist, 1e-6)
-            r_dist    = self.W_DISTANCE * (1.0 - norm_dist)
-            shaped   += r_dist
-            log[f"dist_{task}"] = r_dist
+            # 2. Normalised distance (Zeroed out via W_DISTANCE = 0.0, left here for safe structure)
+            if self.W_DISTANCE > 0:
+                norm_dist = curr_dist / max(max_dist, 1e-6)
+                r_dist    = self.W_DISTANCE * (1.0 - norm_dist)
+                shaped   += r_dist
+                log[f"dist_{task}"] = r_dist
 
             # 3. Progress (non-gated — used for microwave; kettle uses gated transport below)
             if task != "kettle":
@@ -307,50 +390,82 @@ class DenseRewardWrapper(gym.Wrapper):
 
         # ── Kettle-specific grasp enforcement ─────────────────────────────────
         if "kettle" in self.tasks and not self._task_done.get("kettle", False):
+            
+            ee_to_kettle = float(np.linalg.norm(ee_xyz - kettle_xyz)) if ee_xyz is not None else float('inf')
+            kettle_z = float(kettle_xyz[2])
+            kettle_movement = float(np.linalg.norm(kettle_xyz - self._prev_kettle_xyz))
 
-            # 4. EE approach reward — continuous signal to move arm toward kettle
+            # 4. Approach Reward (Targeting the newly fixed kettle_site)
             r_approach = 0.0
-            if ee_xyz is not None:
-                ee_to_kettle = float(np.linalg.norm(ee_xyz - kettle_xyz))
-                if ee_to_kettle < self.APPROACH_THRESH:
-                    # Normalised: 1.0 when touching, 0.0 at threshold boundary
-                    r_approach = self.W_APPROACH * (1.0 - ee_to_kettle / self.APPROACH_THRESH)
+            handle_xyz = self._kettle_handle_xyz()
+            ee_to_kettle = float(np.linalg.norm(ee_xyz - handle_xyz)) if (ee_xyz is not None and handle_xyz is not None) else float('inf')
+
+            if ee_to_kettle < self._min_ee_to_kettle:
+                if self._min_ee_to_kettle != float('inf'): 
+                    progress = self._min_ee_to_kettle - ee_to_kettle
+                    if progress > 0:
+                        r_approach = self.W_APPROACH * progress
+                self._min_ee_to_kettle = ee_to_kettle
+
             shaped += r_approach
             log["approach"] = r_approach
+            
+            r_stay_close = 0.0
+            if ee_to_kettle < 0.10:
+                r_stay_close = 0.5 * (0.10 - ee_to_kettle) / 0.10
+            shaped += r_stay_close
+            log["stay_close"] = r_stay_close
 
-            # 5. Gripper closure reward — exponential kernel, peaks at gap=0
-            #    Only active when EE is near the kettle (within APPROACH_THRESH*1.5)
+            # 4.5 Gated Gripper Closure (The Anti-Fist-Pump Logic)
+            r_close = 0.0
+            if not self._has_grasped and ee_to_kettle < 0.06:
+                if self._is_touching_kettle():
+                    r_close = 8.0 * (0.08 - gripper_gap)   # bumped from 5.0
+                elif gripper_gap < 0.05:
+                    r_close = -3.0 * ((0.05 - gripper_gap) / 0.05)  # scaled, up to -3.0
+            
+            shaped += r_close
+            log["gripper_closure"] = r_close
+
+            # 5. Grasp Reward (The 10-Point Milestone)
             r_grasp = 0.0
-            if ee_xyz is not None:
-                ee_to_kettle = float(np.linalg.norm(ee_xyz - kettle_xyz))
-                if ee_to_kettle < self.APPROACH_THRESH * 1.5:
-                    norm_gap = gripper_gap / max(_GRIPPER_MAX_GAP, 1e-6)
-                    r_grasp  = self.W_GRASP * np.exp(-self.GRASP_K * norm_gap)
+            if not self._has_grasped and ee_to_kettle < 0.05:
+                # Gap < 0.05 allows for the 3.2cm wooden handle thickness
+                if gripper_gap < 0.030 and self._is_touching_kettle():
+                    r_grasp = self.BONUS_GRASP
+                    self._has_grasped = True
+                    
             shaped += r_grasp
-            log["grasp_closure"] = r_grasp
+            log["grasp_milestone"] = r_grasp
 
-            # 6. Lift reward + gated transport
-            #    Transport credit only flows when the kettle is lifted off the surface.
-            kettle_z   = float(kettle_xyz[2])
-            is_lifted  = kettle_z > (_KETTLE_REST_Z + _KETTLE_LIFT_MIN)
-
+            # 6. Lift Reward (One-Time Milestone)
             r_lift = 0.0
-            if is_lifted:
-                lift_above = kettle_z - (_KETTLE_REST_Z + _KETTLE_LIFT_MIN)
-                r_lift = self.W_LIFT * min(lift_above / 0.10, 1.0)  # saturates at 10 cm above
+            is_lifted = kettle_z > (self._initial_kettle_z + _KETTLE_LIFT_MIN)
+            if not self._has_lifted and is_lifted:
+                if self._has_grasped:
+                    r_lift = self.BONUS_LIFT
+                    self._has_lifted = True
             shaped += r_lift
-            log["lift"] = r_lift
+            log["lift_milestone"] = r_lift
 
-            # Gated transport: progress toward goal only counts while lifted
+            if is_lifted and not self._has_grasped and gripper_gap > 0.03:
+                r_wedge_penalty = -5.0
+                shaped += r_wedge_penalty
+                log["wedge_penalty"] = r_wedge_penalty
+
+            # 7. Gated Transport (Continuous, scaled up)
             r_transport = 0.0
-            if is_lifted:
-                kettle_dist      = self._prev_dist.get("kettle", 0.0)
+            if is_lifted and self._has_grasped:
+                kettle_dist = self._prev_dist.get("kettle", 0.0)
                 curr_kettle_dist = self._task_distance(raw_obs, "kettle")
-                r_transport      = self.W_TRANSPORT * (kettle_dist - curr_kettle_dist)
+                # Only reward positive progress to prevent wiggle farming on transport
+                progress = kettle_dist - curr_kettle_dist
+                if progress > 0: 
+                    r_transport = self.W_TRANSPORT * progress
             shaped += r_transport
             log["transport_gated"] = r_transport
 
-            # 7. Push penalty — fires when kettle moves horizontally with open gripper
+            # 8. Push Penalty 
             r_push_penalty = 0.0
             if self._prev_kettle_xy is not None:
                 xy_movement = float(np.linalg.norm(kettle_xyz[:2] - self._prev_kettle_xy))
@@ -359,14 +474,15 @@ class DenseRewardWrapper(gym.Wrapper):
             shaped += r_push_penalty
             log["push_penalty"] = r_push_penalty
 
-        # Update previous kettle xy for next step
+        # Update previous trackers for next step
         self._prev_kettle_xy = kettle_xyz[:2].copy()
+        self._prev_kettle_xyz = kettle_xyz.copy()
 
         total_reward = env_reward + shaped
 
         # Log everything to info for TensorBoard
-        info["shaped_reward"]   = float(shaped)
-        info["original_reward"] = float(env_reward)
+        info["shaped_reward"]    = float(shaped)
+        info["original_reward"]  = float(env_reward)
         info["reward_breakdown"] = log
 
         return obs, total_reward, terminated, truncated, info
@@ -470,38 +586,55 @@ def make_env(render_mode=None, use_asr: bool = True, use_shaped_reward: bool = T
 
 class TensorboardCallback(BaseCallback):
     """
-    Logs reward stats every log_freq steps, including a full per-component
-    breakdown (approach, grasp_closure, lift, transport_gated, push_penalty…)
-    so you can diagnose exactly which reward terms the agent is collecting.
+    Logs reward stats every log_freq steps.
+    UPDATED: Accumulates reward components as EPISODE SUMS instead of step means,
+    which is crucial for tracking one-time milestones correctly.
     """
 
     def __init__(self, log_freq: int = 10_000, run_name: str = "run"):
         super().__init__(verbose=0)
         self.log_freq        = log_freq
         self.run_name        = run_name
-        self._window_returns:    list[float]             = []
-        self._window_lengths:    list[float]             = []
-        self._window_shaped:     list[float]             = []
-        self._window_original:   list[float]             = []
-        self._component_windows: dict[str, list[float]]  = {}
-        self._total_episodes:    int                     = 0
+        self._window_returns:    list[float] = []
+        self._window_lengths:    list[float] = []
+        self._window_shaped:     list[float] = []
+        self._window_original:   list[float] = []
+        self._total_episodes:    int         = 0
+        
+        # Active accumulators for each parallel environment
+        self._current_ep_components = None 
+        
+        # History of completed episode sums to log to TensorBoard
+        self._ep_component_history = defaultdict(list)
+
+    def _on_training_start(self) -> None:
+        # Initialize an accumulator dictionary for each parallel env (e.g., 8 envs)
+        n_envs = self.training_env.num_envs
+        self._current_ep_components = [defaultdict(float) for _ in range(n_envs)]
 
     def _on_step(self) -> bool:
-        for info in self.locals["infos"]:
-            if "episode" in info:
-                self._window_returns.append(float(info["episode"]["r"]))
-                self._window_lengths.append(float(info["episode"]["l"]))
-                self._total_episodes += 1
+        for i, info in enumerate(self.locals["infos"]):
+            
+            # 1. Accumulate per-step breakdown into the current episode's total
+            for component, value in info.get("reward_breakdown", {}).items():
+                self._current_ep_components[i][component] += float(value)
+
             if "shaped_reward" in info:
                 self._window_shaped.append(float(info["shaped_reward"]))
             if "original_reward" in info:
                 self._window_original.append(float(info["original_reward"]))
-            # Accumulate per-component breakdown
-            for component, value in info.get("reward_breakdown", {}).items():
-                if component not in self._component_windows:
-                    self._component_windows[component] = []
-                self._component_windows[component].append(float(value))
 
+            # 2. When an episode ends, push its totals to history and reset
+            if "episode" in info:
+                self._window_returns.append(float(info["episode"]["r"]))
+                self._window_lengths.append(float(info["episode"]["l"]))
+                self._total_episodes += 1
+                
+                for comp, val in self._current_ep_components[i].items():
+                    self._ep_component_history[comp].append(val)
+                self._current_ep_components[i].clear()
+
+        # 3. Log to TensorBoard
         if self.num_timesteps % self.log_freq == 0 and self._window_returns:
             rew = np.array(self._window_returns)
             self.logger.record(f"{self.run_name}/ep_rew_mean",    float(rew.mean()))
@@ -510,26 +643,19 @@ class TensorboardCallback(BaseCallback):
             self.logger.record(f"{self.run_name}/ep_len_mean",    float(np.mean(self._window_lengths)))
             self.logger.record(f"{self.run_name}/episodes_total", self._total_episodes)
 
-            if self._window_shaped:
-                self.logger.record(f"{self.run_name}/shaped_rew_mean",
-                                   float(np.mean(self._window_shaped)))
-            if self._window_original:
-                self.logger.record(f"{self.run_name}/original_rew_mean",
-                                   float(np.mean(self._window_original)))
-
-            # Per-component series — visible individually in TensorBoard
-            for component, values in self._component_windows.items():
+            # Log the MEAN of the EPISODE SUMS for each specific component
+            for component, values in self._ep_component_history.items():
                 if values:
-                    self.logger.record(f"{self.run_name}/rew_{component}",
-                                       float(np.mean(values)))
+                    self.logger.record(f"{self.run_name}/ep_sum_{component}", float(np.mean(values)))
 
             self.logger.dump(self.num_timesteps)
+            
+            # Clear buffers for the next logging window
             self._window_returns.clear()
             self._window_lengths.clear()
             self._window_shaped.clear()
             self._window_original.clear()
-            for v in self._component_windows.values():
-                v.clear()
+            self._ep_component_history.clear()
 
         return True
 
@@ -560,18 +686,18 @@ TOTAL_TIMESTEPS = 2_000_000
 
 _logical_cores  = os.cpu_count() or 8
 N_ENVS          = 8
-_DYNAMIC_BATCH  = 256
+_DYNAMIC_BATCH  = 128
 
 print(f"Auto-selected N_ENVS={N_ENVS} for {_logical_cores} logical CPU cores")
 
 PPO_KWARGS = dict(
-    n_steps       = 2048,
+    n_steps       = 4096,
     batch_size    = _DYNAMIC_BATCH,
-    n_epochs      = 10,
+    n_epochs      = 15,
     gamma         = 0.99,
     gae_lambda    = 0.95,
     clip_range    = 0.2,
-    ent_coef      = 0.01,    # slightly raised from 0.0 → encourages exploration
+    ent_coef      = 0.05,    # slightly raised from 0.0 → encourages exploration
     vf_coef       = 0.5,
     max_grad_norm = 0.5,
     learning_rate = 3e-4,
@@ -725,19 +851,30 @@ def evaluate(
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+
+    ## change it to take an arg for run_training vs evaluation, and for which model to eval
+    
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--run_training", action="store_true")
+    parser.add_argument("--model_path", type=str, default="./ppo_franka_best_ppo_shaped_asr_run_2/best_model.zip")
+    args = parser.parse_args()
+
+    run_training = args.run_training  # Set to False to skip training and run evaluation only
     # ── Shaped + ASR (recommended) ────────────────────────────────────────────
-    log_cb = train(run_name="ppo_shaped_asr_run_2", use_asr=True, use_shaped_reward=True)
-    plot_results(log_cb.episode_returns, title_suffix="Shaped ASR")
+    if run_training:
+        log_cb = train(run_name="ppo_shaped_asr_run_2", use_asr=True, use_shaped_reward=True)
+        plot_results(log_cb.episode_returns, title_suffix="Shaped ASR")
 
     # ── Ablation: sparse baseline — uncomment to compare ─────────────────────
     # log_cb_base = train(run_name="ppo_sparse_baseline", use_asr=True, use_shaped_reward=False)
     # plot_results(log_cb_base.episode_returns, title_suffix="Sparse Baseline")
 
-    # ── Evaluate saved model ──────────────────────────────────────────────────
-    # evaluate(
-    #     model_path        = "./ppo_franka_best_ppo_shaped_asr_run_2/best_model.zip",
-    #     num_episodes      = 10,
-    #     record_video      = True,
-    #     use_asr           = True,
-    #     use_shaped_reward = True,
-    # )
+    else:
+        # ── Evaluate saved model ──────────────────────────────────────────────────
+        evaluate(
+            model_path        = args.model_path,
+            num_episodes      = 10,
+            record_video      = True,
+            use_asr           = True,
+            use_shaped_reward = True,
+        )
