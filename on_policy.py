@@ -100,16 +100,55 @@ _TASK_MAX_DIST = {
 }
 _KETTLE_LIFT_MIN = 0.04
 
-_GRIPPER_R_IDX  = 7
-_GRIPPER_L_IDX  = 8
+_GRIPPER_R_IDX   = 7
+_GRIPPER_L_IDX   = 8
 _GRIPPER_MAX_GAP = 0.08
 
-_KETTLE_XYZ_IDX = [32, 33, 34]
+_KETTLE_XYZ_IDX  = [32, 33, 34]
+
 
 class DenseRewardWrapper(gym.Wrapper):
     """
-    Grasp-aware dense reward wrapper for Franka Kitchen.
-    Includes Orientation Shaping, Pre-Grasp Posture, and Contact Tolerance.
+    Grasp-aware dense reward wrapper for Franka Kitchen — kettle task.
+
+    Fixes applied vs. previous version
+    ────────────────────────────────────
+    BUG 1  — Transport stale-distance fix:
+               prev_distances snapshot is taken BEFORE the per-task loop
+               so the transport block reads the distance from the previous
+               step, not the one that was just overwritten.
+
+    BUG 2  — Push penalty capped at 5× threshold to prevent runaway
+               negative spikes that dominated early training.
+
+    BUG 3  — Premature-closure fix (the primary reported failure mode):
+               • opposition is now computed early and promoted to a GATE
+                 for both closure and coordination rewards.
+               • open_approach reward: keeps gripper open while closing in.
+               • premature_close penalty: fires when fingers close before
+                 they are opposing each other across the handle.
+               • coordination guard tightened with fingers_opposing gate.
+               • closure spatial threshold widened to 0.06 m (was 0.04 m)
+                 so the signal can actually fire once fingers are in place.
+
+    Reward ladder (roughly ordered by episode timeline)
+    ────────────────────────────────────────────────────
+      global_reach       potential-based, always active pre-grasp
+      approach           potential-based inside 0.25 m pre-grasp
+      alignment          direct value, orientation toward handle
+      proximity          exponential pull inside 0.15 m
+      open_approach      keep gripper open while closing in       [NEW]
+      finger_centering   midpoint + opposition bonus
+      premature_close    penalty for closing without opposition    [NEW]
+      closure            gated on fingers_opposing + touch        [FIXED]
+      coordination       gated on fingers_opposing                [FIXED]
+      grasp_milestone    one-time +30 on confirmed grasp
+      lift_milestone     one-time +20 on grasped lift             [bumped]
+      transport_gated    potential-based, gated on lift+grasp     [FIXED]
+      completion         one-time +150
+      wedge_penalty      per-step penalty for open-gripper lift
+      push_penalty       capped per-step penalty for sliding kettle [FIXED]
+      time_penalty       small constant per step
     """
 
     # ── Shared weights ────────────────────────────────────────────────────────
@@ -119,15 +158,18 @@ class DenseRewardWrapper(gym.Wrapper):
     TIME_PENALTY     = -0.02
 
     # ── Kettle-specific weights ───────────────────────────────────────────────
-    W_APPROACH       = 25.0
-    APPROACH_THRESH  = 0.20
-    BONUS_GRASP      = 30.0
-    BONUS_LIFT       = 15.0
-    W_TRANSPORT      = 15.0
-    W_PUSH_PENALTY   = 1.0     
-    PUSH_MOVE_THRESH = 0.003
-    PUSH_OPEN_THRESH = 0.04
-    W_WEDGE_PENALTY  = 1.5      
+    W_APPROACH            = 25.0
+    APPROACH_THRESH       = 0.20
+    BONUS_GRASP           = 30.0
+    BONUS_LIFT            = 20.0      # bumped: lift > grasp makes more sense
+    W_TRANSPORT           = 15.0
+    W_PUSH_PENALTY        = 1.0
+    PUSH_MOVE_THRESH      = 0.003
+    PUSH_PENALTY_CAP      = 5.0       # NEW: caps multiplier so penalty ≤ 5×
+    W_WEDGE_PENALTY       = 1.5
+    W_OPEN_APPROACH       = 2.0       # NEW: reward keeping gripper open while closing in
+    W_PREMATURE_CLOSE     = 3.0       # NEW: penalty for closing without opposition
+    OPPOSITION_GATE       = -0.7      # NEW: dot-product threshold to consider fingers opposing
     # ─────────────────────────────────────────────────────────────────────────
 
     def __init__(self, env, tasks: list[str] = TASKS):
@@ -141,10 +183,10 @@ class DenseRewardWrapper(gym.Wrapper):
         self._prev_kettle_xy:  np.ndarray | None = None
         self._prev_kettle_xyz: np.ndarray | None = None
 
-        self._min_ee_to_kettle: float = float('inf')
+        self._min_ee_to_kettle:  float       = float('inf')
         self._prev_ee_to_kettle: float | None = None
-        self._has_grasped:      bool  = False
-        self._has_lifted:       bool  = False
+        self._has_grasped:       bool         = False
+        self._has_lifted:        bool         = False
 
         _model = self.env.unwrapped.model
         self._kettle_bodies = {
@@ -155,6 +197,9 @@ class DenseRewardWrapper(gym.Wrapper):
             mujoco.mj_name2id(_model, mujoco.mjtObj.mjOBJ_BODY, name)
             for name in ('panda0_leftfinger', 'panda0_rightfinger')
         } - {-1}
+
+        self._lf_id = mujoco.mj_name2id(_model, mujoco.mjtObj.mjOBJ_BODY, 'panda0_leftfinger')
+        self._rf_id = mujoco.mj_name2id(_model, mujoco.mjtObj.mjOBJ_BODY, 'panda0_rightfinger')
 
     # ── MuJoCo helpers ────────────────────────────────────────────────────────
 
@@ -169,7 +214,6 @@ class DenseRewardWrapper(gym.Wrapper):
             return None
 
     def _ee_xmat(self) -> np.ndarray | None:
-        """NEW: Gets the 3x3 rotation matrix of the end-effector to track orientation."""
         try:
             model = self.env.unwrapped.model
             data  = self.env.unwrapped.data
@@ -195,14 +239,15 @@ class DenseRewardWrapper(gym.Wrapper):
 
     def _is_touching_kettle(self) -> bool:
         try:
-            data = self.env.unwrapped.data
+            data  = self.env.unwrapped.data
             model = self.env.unwrapped.model
             if not self._kettle_bodies or not self._finger_bodies: return False
             for i in range(data.ncon):
                 contact = data.contact[i]
-                body1 = model.geom_bodyid[contact.geom1]
-                body2 = model.geom_bodyid[contact.geom2]
-                if ({body1, body2} & self._kettle_bodies and {body1, body2} & self._finger_bodies):
+                body1   = model.geom_bodyid[contact.geom1]
+                body2   = model.geom_bodyid[contact.geom2]
+                if ({body1, body2} & self._kettle_bodies and
+                        {body1, body2} & self._finger_bodies):
                     return True
             return False
         except Exception:
@@ -218,11 +263,21 @@ class DenseRewardWrapper(gym.Wrapper):
         except Exception:
             return None
 
+    def _finger_positions(self):
+        """Returns (lf_pos, rf_pos) or (None, None) on failure."""
+        try:
+            data   = self.env.unwrapped.data
+            lf_pos = data.xpos[self._lf_id].copy() if self._lf_id != -1 else None
+            rf_pos = data.xpos[self._rf_id].copy() if self._rf_id != -1 else None
+            return lf_pos, rf_pos
+        except Exception:
+            return None, None
+
     # ── Episode reset ─────────────────────────────────────────────────────────
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
-        raw_obs = obs["observation"]
+        raw_obs   = obs["observation"]
         for task in self.tasks:
             self._prev_dist[task] = self._task_distance(raw_obs, task)
             self._task_done[task] = False
@@ -231,10 +286,10 @@ class DenseRewardWrapper(gym.Wrapper):
         self._prev_kettle_xyz  = self._kettle_xyz(raw_obs).copy()
         self._initial_kettle_z = float(self._kettle_xyz(raw_obs)[2])
 
-        self._min_ee_to_kettle = float('inf')
-        self._prev_ee_to_kettle = None 
-        self._has_grasped      = False
-        self._has_lifted       = False
+        self._min_ee_to_kettle  = float('inf')
+        self._prev_ee_to_kettle = None
+        self._has_grasped       = False
+        self._has_lifted        = False
 
         return obs, info
 
@@ -254,6 +309,12 @@ class DenseRewardWrapper(gym.Wrapper):
         gripper_gap = self._gripper_gap(raw_obs)
         ee_xyz      = self._ee_xyz()
         ee_xmat     = self._ee_xmat()
+
+        # ── BUG 1 FIX: snapshot distances BEFORE the per-task loop ────────────
+        # The loop overwrites self._prev_dist[task] at the end of each
+        # iteration. The transport block (step 10) needs the value from
+        # the *previous* step, so we capture it here.
+        prev_distances_snapshot = {t: self._prev_dist[t] for t in self.tasks}
 
         # ── Per-task shared terms ─────────────────────────────────────────────
         for task in self.tasks:
@@ -279,139 +340,218 @@ class DenseRewardWrapper(gym.Wrapper):
                 shaped += r_prog
                 log[f"progress_{task}"] = r_prog
 
-            self._prev_dist[task] = curr_dist
+            self._prev_dist[task] = curr_dist   # update after reading
 
         # ── Kettle-specific grasp enforcement ─────────────────────────────────
         if "kettle" in self.tasks and not self._task_done.get("kettle", False):
 
-            kettle_z = float(kettle_xyz[2])
-            
+            kettle_z   = float(kettle_xyz[2])
             handle_xyz = self._kettle_handle_xyz()
+
             ee_to_kettle = (
                 float(np.linalg.norm(ee_xyz - handle_xyz))
                 if (ee_xyz is not None and handle_xyz is not None)
                 else float('inf')
             )
 
-            # ── GLOBAL REACH: active from episode start, no distance threshold ──
+            # ── Finger geometry — computed once, used by multiple blocks ──────
+            lf_pos, rf_pos = self._finger_positions()
+
+            opposition      = 0.0   # dot product of unit vectors finger→handle
+            fingers_opposing = False
+            midpoint        = None
+
+            if lf_pos is not None and rf_pos is not None and handle_xyz is not None:
+                midpoint     = (lf_pos + rf_pos) / 2.0
+                lf_to_handle = handle_xyz - lf_pos
+                rf_to_handle = handle_xyz - rf_pos
+                lf_norm      = np.linalg.norm(lf_to_handle)
+                rf_norm      = np.linalg.norm(rf_to_handle)
+                if lf_norm > 1e-6 and rf_norm > 1e-6:
+                    opposition = float(
+                        np.dot(lf_to_handle / lf_norm, rf_to_handle / rf_norm)
+                    )
+                    # opposition < OPPOSITION_GATE  →  fingers are on opposite
+                    # sides of the handle, i.e. in a valid pre-grasp posture
+                    fingers_opposing = opposition < self.OPPOSITION_GATE
+
+            # ── 1. GLOBAL REACH — potential-based, no gate ────────────────────
             r_global_reach = 0.0
             if not self._has_grasped and ee_xyz is not None and handle_xyz is not None:
                 if self._prev_ee_to_kettle is not None:
-                    # Potential-based — same formula but NO distance gate
                     r_global_reach = 8.0 * (self._prev_ee_to_kettle - ee_to_kettle)
-                    # Positive when closing, zero when hovering, negative when retreating
-                    # Active from 1.0m all the way to contact — no dead zone
-
             shaped += r_global_reach
             log["global_reach"] = r_global_reach
 
-            # Replace your step-delta block with this:
+            # ── 2. APPROACH — potential-based inside 0.25 m ───────────────────
             r_approach = 0.0
             if ee_to_kettle < 0.25 and not self._has_grasped:
-                
-                # Potential-based: always rewards being closer, no hover plateaus
-                # φ(s) = -distance, so r = γ·φ(s') - φ(s) = always positive when closing
-                potential = -ee_to_kettle  # closer = higher potential
                 if self._prev_ee_to_kettle is not None:
-                    prev_potential = -self._prev_ee_to_kettle
-                    r_approach = self.W_APPROACH * (potential - prev_potential)
-                    # This equals 12.0 * (prev_dist - curr_dist) — always pulling forward
-                    # No plateau: hovering gives exactly 0, moving away gives negative
-
+                    r_approach = self.W_APPROACH * (self._prev_ee_to_kettle - ee_to_kettle)
             shaped += r_approach
             log["approach"] = r_approach
+
+            # Update distance tracker
             self._prev_ee_to_kettle = ee_to_kettle
 
-            # ------------------------------------------------------------------
-            # NEW: 4.1 Orientation Alignment
-            # Rewards the agent for pointing its fingers directly at the handle
-            # ------------------------------------------------------------------
+            # ── 3. ORIENTATION ALIGNMENT ──────────────────────────────────────
             r_align = 0.0
             if ee_xmat is not None and ee_xyz is not None and handle_xyz is not None:
                 if ee_to_kettle < 0.25 and not self._has_grasped:
                     dir_to_handle = handle_xyz - ee_xyz
                     norm = np.linalg.norm(dir_to_handle)
                     if norm > 1e-6:
-                        dir_to_handle = dir_to_handle / norm
-                        # Franka Z-axis is typically the forward vector out of the fingers
-                        gripper_forward = ee_xmat[:, 2] 
-                        alignment = float(np.dot(gripper_forward, dir_to_handle))
-                        
-                        # Only reward if it's pointing generally towards it (>0)
-                        # Multiplier increases as it gets physically closer
-                        if alignment > 0:
-                            r_align = 3.0 * alignment * (0.25 - ee_to_kettle)
+                        dir_to_handle  /= norm
+                        gripper_forward = ee_xmat[:, 2]
+                        alignment_val   = float(np.dot(gripper_forward, dir_to_handle))
+                        if alignment_val > 0:
+                            r_align = 3.0 * alignment_val * (0.25 - ee_to_kettle)
             shaped += r_align
             log["alignment"] = r_align
 
-            # Replace your r_pre_grasp + r_close blocks with this unified term:
-            r_grasp_pull = 0.0
+            # ── 4. PROXIMITY — exponential pull inside 0.15 m ────────────────
+            r_proximity = 0.0
             if not self._has_grasped and ee_to_kettle < 0.15:
-                
-                # Smooth exponential: reward increases sharply as distance → 0
-                # At 0.15m: ~0.1,  at 0.08m: ~1.0,  at 0.04m: ~4.5,  at 0.02m: ~20
-                proximity_reward = np.exp(6.0 * (0.15 - ee_to_kettle)) - 1.0
+                r_proximity = 3.0 * (np.exp(6.0 * (0.15 - ee_to_kettle)) - 1.0)
+            shaped += r_proximity
+            log["proximity"] = r_proximity
 
-                # Gripper should be open far out, closed up close — smooth gate
-                # At 0.10m: wants open gripper, at 0.03m: wants closed gripper
-                ideal_gap = np.clip(ee_to_kettle * 0.8, 0.01, 0.08)
-                gap_error = abs(gripper_gap - ideal_gap)
-                gap_reward = np.exp(-30.0 * gap_error)  # peaks when gap matches ideal
+            # ── 5. OPEN-APPROACH — reward keeping gripper open while closing in
+            # [NEW] Prevents the agent from pre-closing before it reaches the
+            # handle. Pays proportionally to both openness and proximity.
+            r_open_approach = 0.0
+            if not self._has_grasped and ee_to_kettle < 0.15:
+                openness        = gripper_gap / _GRIPPER_MAX_GAP   # 1=open, 0=closed
+                r_open_approach = self.W_OPEN_APPROACH * openness * (0.15 - ee_to_kettle)
+            shaped += r_open_approach
+            log["open_approach"] = r_open_approach
 
-                r_grasp_pull = 5.0 * proximity_reward * gap_reward
+            # ── 6. FINGER CENTERING ───────────────────────────────────────────
+            r_center = 0.0
+            if not self._has_grasped and handle_xyz is not None and midpoint is not None:
+                mid_to_handle = float(np.linalg.norm(midpoint - handle_xyz))
+                if mid_to_handle < 0.08:
+                    r_center = 1.5 * (0.08 - mid_to_handle)
+                    if mid_to_handle < 0.032:
+                        r_center += 0.1
 
-            shaped += r_grasp_pull
-            log["grasp_pull"] = r_grasp_pull
+                # opposition bonus
+                if opposition < 0:
+                    r_center += 1.5 * (-opposition)
 
-            # 5. Grasp milestone
+                # ── HANDLE AXIS ALIGNMENT — NEW ───────────────────────────────
+                # The handle is a horizontal capsule running along X in local frame
+                # (euler="0 1.57 0"). Penalise the finger midpoint sliding toward
+                # either tip of the handle (±0.1 m from center) instead of gripping
+                # the middle. Only fires when fingers are already close enough to
+                # matter (mid_to_handle < 0.08).
+                if mid_to_handle < 0.08:
+                    try:
+                        data  = self.env.unwrapped.data
+                        model = self.env.unwrapped.model
+                        kb_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, 'kettleroot')
+                        if kb_id != -1:
+                            kettle_xmat       = data.xmat[kb_id].reshape(3, 3)
+                            handle_axis_world = kettle_xmat @ np.array([1.0, 0.0, 0.0])
+                            axial_offset      = float(np.dot(midpoint - handle_xyz, handle_axis_world))
+                            if abs(axial_offset) > 0.07:   # drifting toward handle tip
+                                r_center -= 1.0 * (abs(axial_offset) - 0.07)
+                    except Exception:
+                        pass
+
+            shaped += r_center
+            log["finger_centering"] = r_center
+
+            # ── 7. PREMATURE CLOSE PENALTY ────────────────────────────────────
+            # [NEW] Active penalty when the gripper is closing inside approach
+            # range but the fingers are NOT yet opposing each other.
+            # This directly counteracts the failure mode of pre-closing.
+            r_premature_close = 0.0
+            if not self._has_grasped and ee_to_kettle < 0.10 and not fingers_opposing:
+                if gripper_gap < 0.06:   # fingers have started closing
+                    r_premature_close = -self.W_PREMATURE_CLOSE * (0.06 - gripper_gap)
+            shaped += r_premature_close
+            log["premature_close"] = r_premature_close
+
+            # ── 8. CLOSURE — gated on fingers_opposing + touch ────────────────
+            # [FIXED] Now requires fingers_opposing so closure reward only
+            # fires when the fingers are actually straddling the handle.
+            # Spatial threshold widened to 0.06 m (was 0.04 m) so the gate
+            # can trigger once the fingers are properly positioned.
+            r_closure = 0.0
+            if not self._has_grasped and ee_to_kettle < 0.06 and fingers_opposing:
+                if self._is_touching_kettle():
+                    # 0 when fully open (0.08 m), 1 at handle contact width (0.064 m)
+                    closure_progress = (0.08 - gripper_gap) / (0.08 - 0.064)
+                    r_closure = 6.0 * np.clip(closure_progress, 0.0, 1.0)
+            shaped += r_closure
+            log["closure"] = r_closure
+
+            # ── 9. COORDINATION BONUS — gated on fingers_opposing ─────────────
+            # [FIXED] fingers_opposing gate added so this can't fire while
+            # the gripper is pre-closing from the wrong position.
+            r_coord = 0.0
+            if (not self._has_grasped and ee_to_kettle < 0.07
+                    and gripper_gap < 0.05 and fingers_opposing):
+                r_coord = 4.0 * (0.07 - ee_to_kettle) * (0.05 - gripper_gap)
+            shaped += r_coord
+            log["coordination"] = r_coord
+
+            # ── 10. GRASP MILESTONE ───────────────────────────────────────────
             r_grasp = 0.0
-            if not self._has_grasped and ee_to_kettle < 0.05:
-                if gripper_gap < 0.050 and self._is_touching_kettle():
-                    r_grasp = self.BONUS_GRASP
+            if not self._has_grasped and ee_to_kettle < 0.06 and fingers_opposing:
+                if gripper_gap < 0.072 and self._is_touching_kettle():
+                    r_grasp           = self.BONUS_GRASP
                     self._has_grasped = True
             shaped += r_grasp
             log["grasp_milestone"] = r_grasp
 
-            # 6. Lift milestone 
-            r_lift = 0.0
+            # ── 11. LIFT MILESTONE ────────────────────────────────────────────
             is_lifted = kettle_z > (self._initial_kettle_z + _KETTLE_LIFT_MIN)
-            if not self._has_lifted and is_lifted:
-                if self._has_grasped:  
-                    r_lift = self.BONUS_LIFT
-                    self._has_lifted = True
+            r_lift = 0.0
+            if not self._has_lifted and is_lifted and self._has_grasped:
+                r_lift           = self.BONUS_LIFT
+                self._has_lifted = True
             shaped += r_lift
             log["lift_milestone"] = r_lift
 
-            # 6.5 Wedge penalty 
+            # ── 12. WEDGE PENALTY ─────────────────────────────────────────────
             r_wedge = 0.0
             if is_lifted and not self._has_grasped and gripper_gap > 0.03:
                 r_wedge = -self.W_WEDGE_PENALTY
             shaped += r_wedge
             log["wedge_penalty"] = r_wedge
 
-            # 7. Gated transport
+            # ── 13. GATED TRANSPORT ───────────────────────────────────────────
+            # [FIXED] Uses prev_distances_snapshot which was captured before
+            # the per-task loop updated self._prev_dist["kettle"]. This means
+            # `prev_kettle_dist` is genuinely from the previous timestep.
             r_transport = 0.0
-            if is_lifted and self._has_grasped:  
-                kettle_dist      = self._prev_dist.get("kettle", 0.0)
+            if is_lifted and self._has_grasped:
+                prev_kettle_dist = prev_distances_snapshot.get("kettle", 0.0)
                 curr_kettle_dist = self._task_distance(raw_obs, "kettle")
-                progress         = kettle_dist - curr_kettle_dist
+                progress         = prev_kettle_dist - curr_kettle_dist
                 if progress > 0:
                     r_transport = self.W_TRANSPORT * progress
             shaped += r_transport
             log["transport_gated"] = r_transport
 
-            # 8. Push penalty (UPDATED: Suppressed when very close to handle)
+            # ── 14. PUSH PENALTY — capped ─────────────────────────────────────
+            # [FIXED] Raw multiplier (xy_movement / PUSH_MOVE_THRESH) can be
+            # very large (e.g. 10×) and dominate early training. Capped at
+            # PUSH_PENALTY_CAP to bound the per-step magnitude.
             r_push_penalty = 0.0
             if self._prev_kettle_xy is not None:
                 xy_movement = float(np.linalg.norm(kettle_xyz[:2] - self._prev_kettle_xy))
-                if xy_movement > self.PUSH_MOVE_THRESH and gripper_gap > self.PUSH_OPEN_THRESH:
-                    # ONLY penalize if the gripper is outside the 0.08m contact zone
+                if xy_movement > self.PUSH_MOVE_THRESH and not self._has_grasped:
                     if ee_to_kettle > 0.08:
-                        r_push_penalty = -self.W_PUSH_PENALTY * (xy_movement / self.PUSH_MOVE_THRESH)
+                        multiplier     = min(xy_movement / self.PUSH_MOVE_THRESH,
+                                             self.PUSH_PENALTY_CAP)
+                        r_push_penalty = -self.W_PUSH_PENALTY * multiplier
             shaped += r_push_penalty
             log["push_penalty"] = r_push_penalty
 
-        # Update trackers
+        # ── Update trackers ───────────────────────────────────────────────────
         self._prev_kettle_xy  = kettle_xyz[:2].copy()
         self._prev_kettle_xyz = kettle_xyz.copy()
 
@@ -488,7 +628,7 @@ class AugmentedObsWrapper(gym.ObservationWrapper):
     """
     Appends task-relevant derived features to the ASR observation.
 
-    Added dims (5 total):
+    Added dims (15 total):
       [0:3] — EE → kettle handle vector (3D)   tells the agent exactly which
                direction to move without having to discover subtraction
       [3]   — EE → handle scalar distance       salient proximity signal
@@ -625,7 +765,7 @@ class AugmentedObsWrapper(gym.ObservationWrapper):
             e = self.env
             while hasattr(e, 'env'):
                 if hasattr(e, '_initial_kettle_z'):
-                    current_z  = np.float32(obs[34])  # kettle Z in ASR
+                    current_z  = np.float32(obs[25])  # kettle Z in ASR
                     kettle_dz  = current_z - np.float32(e._initial_kettle_z)
                     break
                 e = e.env
@@ -793,7 +933,7 @@ PPO_KWARGS = dict(
     vf_coef       = 0.5,
     max_grad_norm = 0.5,
     learning_rate = 3e-4,
-    policy_kwargs = dict(net_arch=dict(pi=[512, 512, 256], vf=[512, 512, 256])),  # larger network
+    policy_kwargs = dict(net_arch=dict(pi=[256, 256], vf=[256, 256])),  # larger network
     verbose       = 0,
     tensorboard_log = "./ppo_franka_tb/",
 )
@@ -843,7 +983,7 @@ def train(
         verbose     = 1,
     )
 
-    model = PPO("MlpPolicy", vec_env, **PPO_KWARGS, device="cpu")
+    model = PPO("MlpPolicy", vec_env, **PPO_KWARGS, device="cuda")
 
     print(f"\nPolicy architecture:\n{model.policy}\n")
     print(f"Training for {TOTAL_TIMESTEPS:,} timesteps across {N_ENVS} parallel envs…\n")
