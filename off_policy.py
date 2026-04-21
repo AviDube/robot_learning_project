@@ -648,8 +648,9 @@ if __name__ == "__main__":
         else:
             print("Replay buffer file not found next to checkpoint; continuing without it.")
     else:
+        policy = "MlpPolicy" if USE_FLATTEN_OBS_WRAPPER else "MultiInputPolicy"
         model = SAC(
-            policy="MultiInputPolicy",
+            policy=policy,
             env=train_env,
             learning_rate=3e-4,
             buffer_size=1_000_000,
