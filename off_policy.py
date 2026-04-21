@@ -1,11 +1,34 @@
+
+
 import argparse
 import os
+import site
+import sys
 from typing import Any, Dict, Tuple
+
+
+def _remove_user_site_from_sys_path() -> None:
+    # Prevent ~/.local packages (possibly different CPU arch) from shadowing env packages.
+    try:
+        user_site = site.getusersitepackages()
+    except Exception:
+        return
+
+    user_site_norm = os.path.normpath(user_site)
+    sys.path = [p for p in sys.path if os.path.normpath(p) != user_site_norm]
+
+
+_remove_user_site_from_sys_path()
+os.environ.setdefault("PYTHONNOUSERSITE", "1")
+
 
 import gymnasium as gym
 import gymnasium_robotics
 import numpy as np
 from gymnasium import spaces
+
+# Import the shared flattening wrapper
+from flatten_obs_wrapper import FlattenObsWrapper
 
 from stable_baselines3 import SAC
 from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor, SubprocVecEnv
@@ -55,6 +78,13 @@ TOTAL_TIMESTEPS = 2_000_000
 N_ENVS = 8
 SEED = 42
 USE_HER = False
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 # -------------------------------------------------
@@ -481,6 +511,8 @@ def parse_args():
 # -------------------------------------------------
 # Env factory
 # -------------------------------------------------
+USE_FLATTEN_OBS_WRAPPER = _env_flag("USE_FLATTEN_OBS_WRAPPER", True)
+
 def make_env(rank: int, seed: int = 0):
     def _init():
         env = gym.make(
@@ -489,7 +521,10 @@ def make_env(rank: int, seed: int = 0):
         )
         env = KitchenDenseRewardWrapper(env, config=DENSE_REWARD_CONFIG)
         env = KitchenSuccessInfoWrapper(env, target_tasks=TASKS)
-        env = FlattenNestedDictWrapper(env)
+        if USE_FLATTEN_OBS_WRAPPER:
+            env = FlattenObsWrapper(env)
+        else:
+            env = FlattenNestedDictWrapper(env)
         env.reset(seed=seed + rank)
         return env
     return _init
@@ -503,34 +538,40 @@ def sanity_check_env():
     env = make_env(rank=0, seed=SEED)()
 
     obs, info = env.reset()
-    print("Observation keys:", list(obs.keys()))
-    for k, v in obs.items():
-        if isinstance(v, np.ndarray):
-            print(f"  {k}: shape={v.shape}, dtype={v.dtype}")
-        else:
-            print(f"  {k}: type={type(v)}")
+    if isinstance(obs, dict):
+        print("Observation keys:", list(obs.keys()))
+        for k, v in obs.items():
+            if isinstance(v, np.ndarray):
+                print(f"  {k}: shape={v.shape}, dtype={v.dtype}")
+            else:
+                print(f"  {k}: type={type(v)}")
 
-    assert "observation" in obs, "Missing 'observation' key"
-    assert "achieved_goal" in obs, "Missing 'achieved_goal' key"
-    assert "desired_goal" in obs, "Missing 'desired_goal' key"
+        assert "observation" in obs, "Missing 'observation' key"
+        assert "achieved_goal" in obs, "Missing 'achieved_goal' key"
+        assert "desired_goal" in obs, "Missing 'desired_goal' key"
+    else:
+        print(f"Flattened observation: shape={obs.shape}, dtype={obs.dtype}")
 
     action = env.action_space.sample()
     next_obs, reward, terminated, truncated, info = env.step(action)
     print(f"One step reward: {reward}, terminated={terminated}, truncated={truncated}")
 
-    recomputed_reward = env.compute_reward(
-        next_obs["achieved_goal"],
-        next_obs["desired_goal"],
-        info,
-    )
-    print(f"Recomputed single reward: {recomputed_reward}")
+    if isinstance(next_obs, dict):
+        recomputed_reward = env.compute_reward(
+            next_obs["achieved_goal"],
+            next_obs["desired_goal"],
+            info,
+        )
+        print(f"Recomputed single reward: {recomputed_reward}")
 
-    batch_ag = np.stack([next_obs["achieved_goal"], next_obs["achieved_goal"]], axis=0)
-    batch_dg = np.stack([next_obs["desired_goal"], next_obs["desired_goal"]], axis=0)
-    batch_info = [info, info]
+        batch_ag = [next_obs["achieved_goal"], next_obs["achieved_goal"]]
+        batch_dg = [next_obs["desired_goal"], next_obs["desired_goal"]]
+        batch_info = [info, info]
 
-    batch_reward = env.compute_reward(batch_ag, batch_dg, batch_info)
-    print(f"Recomputed batch reward: {batch_reward}, shape={batch_reward.shape}")
+        batch_reward = env.compute_reward(batch_ag, batch_dg, batch_info)
+        print(f"Recomputed batch reward: {batch_reward}, shape={batch_reward.shape}")
+    else:
+        print("Skipping goal-based reward recomputation for flattened observations.")
 
     print("Base env type:", type(env.unwrapped))
     print("==================================\n")
