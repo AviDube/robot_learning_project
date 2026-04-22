@@ -1,19 +1,28 @@
+import argparse
 import os
-from typing import Any, Dict, Tuple
+import time
 
 import gymnasium as gym
 import gymnasium_robotics
 import numpy as np
-from gymnasium import spaces
+import matplotlib.pyplot as plt
+from gymnasium.wrappers import RecordVideo
 
 from stable_baselines3 import SAC
-from stable_baselines3.her import HerReplayBuffer
 from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor, SubprocVecEnv
 from stable_baselines3.common.callbacks import (
     EvalCallback,
     CheckpointCallback,
     CallbackList,
     BaseCallback,
+)
+
+from on_policy import (
+    DenseRewardWrapper,
+    FlattenObsWrapper,
+    ASRObsWrapper,
+    AugmentedObsWrapper,
+    TASKS,
 )
 
 gym.register_envs(gymnasium_robotics)
@@ -31,174 +40,12 @@ os.makedirs(BEST_MODEL_DIR, exist_ok=True)
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
 ENV_ID = "FrankaKitchen-v1"
-TASKS = ["kettle"]
 
 TOTAL_TIMESTEPS = 1_000_000
 N_ENVS = 8
 SEED = 42
-
-
-# -------------------------------------------------
-# Flatten / unflatten helpers
-# -------------------------------------------------
-def _flatten_dict_space(
-    dict_space: spaces.Dict,
-) -> Tuple[spaces.Box, Dict[str, Tuple[Tuple[int, ...], int, int]]]:
-    lows = []
-    highs = []
-    meta = {}
-    cursor = 0
-
-    for key in sorted(dict_space.spaces.keys()):
-        subspace = dict_space.spaces[key]
-        if not isinstance(subspace, spaces.Box):
-            raise NotImplementedError(
-                f"Only Box subspaces are supported inside nested Dicts, got {type(subspace)} for key '{key}'."
-            )
-
-        flat_low = np.asarray(subspace.low, dtype=np.float32).reshape(-1)
-        flat_high = np.asarray(subspace.high, dtype=np.float32).reshape(-1)
-
-        size = flat_low.shape[0]
-        meta[key] = (subspace.shape, cursor, cursor + size)
-        cursor += size
-
-        lows.append(flat_low)
-        highs.append(flat_high)
-
-    low = np.concatenate(lows, axis=0).astype(np.float32)
-    high = np.concatenate(highs, axis=0).astype(np.float32)
-
-    flat_box = spaces.Box(low=low, high=high, dtype=np.float32)
-    return flat_box, meta
-
-
-def _flatten_nested_value(value: dict) -> np.ndarray:
-    parts = [np.asarray(value[k], dtype=np.float32).reshape(-1) for k in sorted(value.keys())]
-    return np.concatenate(parts, axis=0).astype(np.float32)
-
-
-def _unflatten_nested_value(
-    flat_value: np.ndarray,
-    meta: Dict[str, Tuple[Tuple[int, ...], int, int]],
-) -> dict:
-    flat_value = np.asarray(flat_value, dtype=np.float32).reshape(-1)
-    out = {}
-    for key in sorted(meta.keys()):
-        shape, start, end = meta[key]
-        out[key] = flat_value[start:end].reshape(shape).astype(np.float32)
-    return out
-
-
-# -------------------------------------------------
-# Wrapper
-# -------------------------------------------------
-class FlattenNestedDictWrapper(gym.ObservationWrapper):
-    def __init__(self, env: gym.Env):
-        super().__init__(env)
-
-        if not isinstance(env.observation_space, spaces.Dict):
-            raise TypeError("FlattenNestedDictWrapper expects a Dict observation space.")
-
-        self._nested_meta = {}
-        new_spaces = {}
-
-        for key, space in env.observation_space.spaces.items():
-            if isinstance(space, spaces.Dict):
-                flat_space, meta = _flatten_dict_space(space)
-                new_spaces[key] = flat_space
-                self._nested_meta[key] = meta
-            else:
-                if isinstance(space, spaces.Box):
-                    new_spaces[key] = spaces.Box(
-                        low=np.asarray(space.low, dtype=np.float32),
-                        high=np.asarray(space.high, dtype=np.float32),
-                        dtype=np.float32,
-                    )
-                else:
-                    new_spaces[key] = space
-
-        self.observation_space = spaces.Dict(new_spaces)
-        self._goal_env = self.env.unwrapped
-
-    def observation(self, observation):
-        out = {}
-        for key, value in observation.items():
-            if key in self._nested_meta:
-                out[key] = _flatten_nested_value(value)
-            else:
-                out[key] = np.asarray(value, dtype=np.float32) if isinstance(value, np.ndarray) else value
-        return out
-
-    def _restore_goal_format_single(self, value: Any, key_name: str):
-        if key_name not in self._nested_meta:
-            return value
-        return _unflatten_nested_value(value, self._nested_meta[key_name])
-
-    def _compute_reward_single(self, achieved_goal, desired_goal, info):
-        achieved_goal_restored = self._restore_goal_format_single(achieved_goal, "achieved_goal")
-        desired_goal_restored = self._restore_goal_format_single(desired_goal, "desired_goal")
-
-        reward = self._goal_env.compute_reward(
-            achieved_goal_restored,
-            desired_goal_restored,
-            info,
-        )
-        return float(reward)
-
-    def compute_reward(self, achieved_goal, desired_goal, info):
-        ag = np.asarray(achieved_goal)
-        dg = np.asarray(desired_goal)
-
-        if ag.ndim >= 2:
-            batch_size = ag.shape[0]
-
-            if isinstance(info, (list, tuple)):
-                info_list = list(info)
-                if len(info_list) != batch_size:
-                    if len(info_list) == 1:
-                        info_list = info_list * batch_size
-                    else:
-                        raise ValueError(
-                            f"Batch reward computation got batch_size={batch_size} but len(info)={len(info_list)}."
-                        )
-            else:
-                info_list = [info] * batch_size
-
-            rewards = np.array(
-                [
-                    self._compute_reward_single(ag[i], dg[i], info_list[i])
-                    for i in range(batch_size)
-                ],
-                dtype=np.float32,
-            )
-            return rewards
-
-        return float(self._compute_reward_single(ag, dg, info))
-
-    def compute_terminated(self, achieved_goal, desired_goal, info):
-        achieved_goal_restored = self._restore_goal_format_single(achieved_goal, "achieved_goal")
-        desired_goal_restored = self._restore_goal_format_single(desired_goal, "desired_goal")
-
-        if hasattr(self._goal_env, "compute_terminated"):
-            return self._goal_env.compute_terminated(
-                achieved_goal_restored, desired_goal_restored, info
-            )
-        raise AttributeError(
-            f"Underlying unwrapped env of type {type(self._goal_env)} has no compute_terminated()."
-        )
-
-    def compute_truncated(self, achieved_goal, desired_goal, info):
-        achieved_goal_restored = self._restore_goal_format_single(achieved_goal, "achieved_goal")
-        desired_goal_restored = self._restore_goal_format_single(desired_goal, "desired_goal")
-
-        if hasattr(self._goal_env, "compute_truncated"):
-            return self._goal_env.compute_truncated(
-                achieved_goal_restored, desired_goal_restored, info
-            )
-        raise AttributeError(
-            f"Underlying unwrapped env of type {type(self._goal_env)} has no compute_truncated()."
-        )
+USE_ASR = True
+USE_SHAPED_REWARD = True
 
 
 # -------------------------------------------------
@@ -258,17 +105,42 @@ class InfoStatsCallback(BaseCallback):
         return True
 
 
+class TrainingLogCallback(BaseCallback):
+    """Logs and stores episode returns for plotting."""
+
+    def __init__(self, log_freq: int = 2048, verbose: int = 1):
+        super().__init__(verbose)
+        self.log_freq = log_freq
+        self.episode_returns: list[float] = []
+
+    def _on_step(self) -> bool:
+        infos = self.locals.get("infos", [])
+        for info in infos:
+            if "episode" in info:
+                self.episode_returns.append(float(info["episode"]["r"]))
+
+        if self.n_calls % self.log_freq == 0 and self.episode_returns:
+            mean_ret = float(np.mean(self.episode_returns[-20:]))
+            print(f"  Steps: {self.num_timesteps:>8,} | Mean Return (last 20 eps): {mean_ret:>8.3f}")
+        return True
+
+
 # -------------------------------------------------
 # Env factory
 # -------------------------------------------------
-def make_env(rank: int, seed: int = 0):
+def make_env(rank: int, seed: int = 0, use_asr: bool = USE_ASR, use_shaped_reward: bool = USE_SHAPED_REWARD):
     def _init():
         env = gym.make(
             ENV_ID,
             tasks_to_complete=TASKS,
         )
+        if use_shaped_reward:
+            env = DenseRewardWrapper(env, tasks=TASKS)
+        env = FlattenObsWrapper(env)
+        if use_asr:
+            env = ASRObsWrapper(env)
+        env = AugmentedObsWrapper(env)
         env = KitchenSuccessInfoWrapper(env)
-        env = FlattenNestedDictWrapper(env)
         env.reset(seed=seed + rank)
         return env
     return _init
@@ -279,61 +151,56 @@ def make_env(rank: int, seed: int = 0):
 # -------------------------------------------------
 def sanity_check_env():
     print("\n========== SANITY CHECK ==========")
-    env = make_env(rank=0, seed=SEED)()
+    env = make_env(rank=0, seed=SEED, use_asr=USE_ASR, use_shaped_reward=USE_SHAPED_REWARD)()
 
     obs, info = env.reset()
-    print("Observation keys:", list(obs.keys()))
-    for k, v in obs.items():
-        if isinstance(v, np.ndarray):
-            print(f"  {k}: shape={v.shape}, dtype={v.dtype}")
-        else:
-            print(f"  {k}: type={type(v)}")
-
-    assert "observation" in obs, "Missing 'observation' key"
-    assert "achieved_goal" in obs, "Missing 'achieved_goal' key"
-    assert "desired_goal" in obs, "Missing 'desired_goal' key"
+    print(f"Observation shape: {obs.shape}, dtype={obs.dtype}")
+    expected_dim = 52 if USE_ASR else 74
+    assert isinstance(obs, np.ndarray), "Expected flat Box observation"
+    assert obs.shape == (expected_dim,), f"Expected obs dim {expected_dim}, got {obs.shape}"
 
     action = env.action_space.sample()
     next_obs, reward, terminated, truncated, info = env.step(action)
     print(f"One step reward: {reward}, terminated={terminated}, truncated={truncated}")
-
-    recomputed_reward = env.compute_reward(
-        next_obs["achieved_goal"],
-        next_obs["desired_goal"],
-        info,
-    )
-    print(f"Recomputed single reward: {recomputed_reward}")
-
-    batch_ag = np.stack([next_obs["achieved_goal"], next_obs["achieved_goal"]], axis=0)
-    batch_dg = np.stack([next_obs["desired_goal"], next_obs["desired_goal"]], axis=0)
-    batch_info = [info, info]
-
-    batch_reward = env.compute_reward(batch_ag, batch_dg, batch_info)
-    print(f"Recomputed batch reward: {batch_reward}, shape={batch_reward.shape}")
 
     print("Base env type:", type(env.unwrapped))
     print("==================================\n")
     env.close()
 
 
-# -------------------------------------------------
-# Main
-# -------------------------------------------------
-if __name__ == "__main__":
-    sanity_check_env()
+def train(
+    run_name: str = "sac_shaped_asr_run_1",
+    use_asr: bool = True,
+    use_shaped_reward: bool = True,
+):
+    obs_label = "ASR-52dim" if use_asr else "FULL-74dim"
+    rew_label = "SHAPED" if use_shaped_reward else "SPARSE"
+    print(f"Run: {run_name}  |  Obs: {obs_label}  |  Reward: {rew_label}")
+    print("Setting up vectorised environments...")
 
-    # Parallel training envs
-    train_env = SubprocVecEnv([make_env(rank=i, seed=SEED) for i in range(N_ENVS)])
+    best_model_dir = f"./sac_franka_best_{run_name}/"
+    eval_log_dir = f"./sac_franka_eval_logs_{run_name}/"
+    checkpoint_dir = f"./sac_franka_checkpoints_{run_name}/"
+
+    os.makedirs(best_model_dir, exist_ok=True)
+    os.makedirs(eval_log_dir, exist_ok=True)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    train_env = SubprocVecEnv([
+        make_env(rank=i, seed=SEED, use_asr=use_asr, use_shaped_reward=use_shaped_reward)
+        for i in range(N_ENVS)
+    ])
     train_env = VecMonitor(train_env)
 
-    # Single eval env
-    eval_env = DummyVecEnv([make_env(rank=10_000, seed=SEED)])
+    eval_env = DummyVecEnv([
+        make_env(rank=10_000, seed=SEED, use_asr=use_asr, use_shaped_reward=use_shaped_reward)
+    ])
     eval_env = VecMonitor(eval_env)
 
     eval_callback = EvalCallback(
         eval_env=eval_env,
-        best_model_save_path=BEST_MODEL_DIR,
-        log_path=LOG_DIR,
+        best_model_save_path=best_model_dir,
+        log_path=eval_log_dir,
         eval_freq=max(10_000 // N_ENVS, 1),
         n_eval_episodes=10,
         deterministic=True,
@@ -342,21 +209,24 @@ if __name__ == "__main__":
 
     checkpoint_callback = CheckpointCallback(
         save_freq=max(50_000 // N_ENVS, 1),
-        save_path=CHECKPOINT_DIR,
-        name_prefix="sac_franka",
+        save_path=checkpoint_dir,
+        name_prefix=f"sac_{run_name}",
     )
 
     info_stats_callback = InfoStatsCallback()
+    training_log_callback = TrainingLogCallback(log_freq=2048)
 
     callbacks = CallbackList([
+        training_log_callback,
         info_stats_callback,
         eval_callback,
         checkpoint_callback,
     ])
 
     model = SAC(
-        policy="MultiInputPolicy",
+        policy="MlpPolicy",
         env=train_env,
+        policy_kwargs=dict(net_arch=dict(pi=[256, 256], qf=[256, 256])),
         learning_rate=3e-4,
         buffer_size=1_000_000,
         learning_starts=100_000,
@@ -366,23 +236,140 @@ if __name__ == "__main__":
         train_freq=1,
         gradient_steps=8,
         ent_coef="auto",
-        replay_buffer_class=HerReplayBuffer,
-        replay_buffer_kwargs=dict(
-            n_sampled_goal=8,
-            goal_selection_strategy="future",
-            copy_info_dict=True,
-        ),
         tensorboard_log=TB_LOG_DIR,
         verbose=1,
         device="cuda",
         seed=SEED,
     )
 
+    print(f"\nPolicy architecture:\n{model.policy}\n")
+    print(f"Training for {TOTAL_TIMESTEPS:,} timesteps across {N_ENVS} parallel envs...\n")
+
     model.learn(
         total_timesteps=TOTAL_TIMESTEPS,
         callback=callbacks,
-        progress_bar=False,
+        progress_bar=True,
     )
 
-    model.save("sac_franka_final")
-    print("Training finished. Saved model to sac_franka_final.zip")
+    save_path = f"sac_franka_kitchen_{run_name}_final"
+    model.save(save_path)
+    print(f"Training finished. Saved model to {save_path}.zip")
+
+    train_env.close()
+    eval_env.close()
+    return training_log_callback
+
+
+def plot_results(episode_returns: list[float], title_suffix: str = ""):
+    if not episode_returns:
+        print("No episode data to plot.")
+        return
+    returns = np.array(episode_returns, dtype=np.float32)
+    window = min(20, len(returns))
+    smoothed = np.convolve(returns, np.ones(window) / window, mode="valid")
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(returns, color="teal", linewidth=1, alpha=0.35, label="Episode Return")
+    plt.plot(
+        range(window - 1, len(returns)),
+        smoothed,
+        color="teal",
+        linewidth=2.5,
+        label=f"Smoothed (window={window})",
+    )
+    plt.xlabel("Episode")
+    plt.ylabel("Return")
+    plt.title(f"SB3 SAC — Franka Kitchen {title_suffix}")
+    plt.legend()
+    plt.grid(True, linestyle="--", alpha=0.5)
+    plt.tight_layout()
+    fname = f"learning_curve_sac{title_suffix.replace(' ', '_')}.png"
+    plt.savefig(fname, dpi=150)
+    plt.show()
+    print(f"Plot saved -> {fname}")
+
+
+def evaluate(
+    model_path: str = "sac_franka_final",
+    num_episodes: int = 5,
+    record_video: bool = True,
+    use_asr: bool = True,
+    use_shaped_reward: bool = True,
+):
+    gym.register_envs(gymnasium_robotics)
+    render_mode = "rgb_array" if record_video else "human"
+    video_folder = "franka_kitchen_eval_videos_sac" if record_video else None
+
+    env = gym.make(
+        ENV_ID,
+        tasks_to_complete=TASKS,
+        render_mode=render_mode,
+    )
+    if use_shaped_reward:
+        env = DenseRewardWrapper(env, tasks=TASKS)
+    env = FlattenObsWrapper(env)
+    if use_asr:
+        env = ASRObsWrapper(env)
+    env = AugmentedObsWrapper(env)
+    env = KitchenSuccessInfoWrapper(env)
+
+    if record_video:
+        env = RecordVideo(env, video_folder=video_folder, episode_trigger=lambda _: True)
+
+    model = SAC.load(model_path, env=env)
+    print(f"\nLoaded: {model_path}  |  ASR={use_asr}  |  Shaped={use_shaped_reward}")
+    print(f"Running {num_episodes} evaluation episodes...\n")
+
+    ep_returns = []
+    for ep in range(num_episodes):
+        obs, _ = env.reset()
+        ep_ret, done = 0.0, False
+        while not done:
+            action, _ = model.predict(obs, deterministic=True)
+            obs, reward, terminated, truncated, _ = env.step(action)
+            if not record_video:
+                time.sleep(0.07)
+            ep_ret += reward
+            done = terminated or truncated
+        ep_returns.append(ep_ret)
+        print(f"  Episode {ep + 1}: return = {ep_ret:.3f}")
+
+    env.close()
+    print(f"\nMean return : {np.mean(ep_returns):.3f}")
+    print(f"Std  return : {np.std(ep_returns):.3f}")
+    if record_video:
+        print(f"Videos saved -> {os.path.abspath(video_folder)}")
+
+
+# -------------------------------------------------
+# Main
+# -------------------------------------------------
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--run_training", action="store_true")
+    parser.add_argument("--record_video", action="store_true")
+    parser.add_argument(
+        "--model_path",
+        type=str,
+        default="sac_franka_best_sac_shaped_asr_run_1/best_model.zip",
+    )
+    args = parser.parse_args()
+
+    if args.run_training:
+        log_cb = train(
+            run_name="sac_shaped_asr_run_1",
+            use_asr=True,
+            use_shaped_reward=True,
+        )
+        plot_results(
+            log_cb.episode_returns,
+            title_suffix="Shaped ASR Augmented DIM Reduction",
+        )
+    else:
+        evaluate(
+            model_path=args.model_path,
+            num_episodes=10,
+            record_video=args.record_video,
+            use_asr=True,
+            use_shaped_reward=True,
+        )

@@ -826,7 +826,7 @@ class AugmentedObsWrapper(gym.ObservationWrapper):
 #       └─ DenseRewardWrapper   ← reads raw Dict obs, augments reward
 #           └─ FlattenObsWrapper ← Dict → flat 59-dim Box
 #               └─ ASRObsWrapper ← 59-dim → 37-dim (drop velocities)
-#                   └─ AugmentedObsWrapper ← 37-dim → 43-dim (+6 derived)
+#                   └─ AugmentedObsWrapper ← 37-dim → 52-dim (+15 derived)
 #                       └─ Monitor
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -979,7 +979,7 @@ def train(
     use_asr           : bool = True,
     use_shaped_reward : bool = True,
 ):
-    obs_label = "ASR-43dim" if use_asr else "FULL-65dim"
+    obs_label = "ASR-52dim" if use_asr else "FULL-74dim"
     rew_label = "SHAPED"    if use_shaped_reward else "SPARSE"
     print(f"Run: {run_name}  |  Obs: {obs_label}  |  Reward: {rew_label}")
     print("Setting up vectorised environments…")
