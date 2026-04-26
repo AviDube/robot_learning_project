@@ -41,8 +41,13 @@ os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
 ENV_ID = "FrankaKitchen-v1"
 
+<<<<<<< HEAD
 TOTAL_TIMESTEPS = 2_000_000
 N_ENVS = 8
+=======
+TOTAL_TIMESTEPS = 10_000_000
+N_ENVS = 30
+>>>>>>> 5637ac2b97d4560285cecdae97fa2d6aed5d367d
 SEED = 42
 USE_ASR = True
 USE_SHAPED_REWARD = True
@@ -201,14 +206,14 @@ def train(
         eval_env=eval_env,
         best_model_save_path=best_model_dir,
         log_path=eval_log_dir,
-        eval_freq=max(10_000 // N_ENVS, 1),
+        eval_freq=max(100_000 // N_ENVS, 1),
         n_eval_episodes=10,
         deterministic=True,
         render=False,
     )
 
     checkpoint_callback = CheckpointCallback(
-        save_freq=max(50_000 // N_ENVS, 1),
+        save_freq=max(500_000 // N_ENVS, 1),
         save_path=checkpoint_dir,
         name_prefix=f"sac_{run_name}",
     )
@@ -229,7 +234,7 @@ def train(
         policy_kwargs=dict(net_arch=dict(pi=[256, 256], qf=[256, 256])),
         learning_rate=3e-4,
         buffer_size=1_000_000,
-        learning_starts=100_000,
+        learning_starts=250_000,
         batch_size=512,
         tau=0.005,
         gamma=0.99,
@@ -298,7 +303,7 @@ def evaluate(
 ):
     gym.register_envs(gymnasium_robotics)
     render_mode = "rgb_array" if record_video else "human"
-    video_folder = "franka_kitchen_eval_videos_sac" if record_video else None
+    video_folder = "franka_kitchen_eval_videos_sac_reduced_dim_asr" if record_video else None
 
     env = gym.make(
         ENV_ID,
@@ -351,19 +356,19 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model_path",
         type=str,
-        default="sac_franka_best_sac_shaped_asr_run_1/best_model.zip",
+        default="sac_franka_best_sac_shaped_reduced_dim_asr_run_1/best_model.zip",
     )
     args = parser.parse_args()
 
     if args.run_training:
         log_cb = train(
-            run_name="sac_shaped_asr_run_1",
+            run_name="sac_shaped_reduced_dim_asr_run_1",
             use_asr=True,
             use_shaped_reward=True,
         )
         plot_results(
             log_cb.episode_returns,
-            title_suffix="Shaped ASR Augmented DIM Reduction",
+            title_suffix="Shaped ASR Augmented with DIM Reduction",
         )
     else:
         evaluate(
