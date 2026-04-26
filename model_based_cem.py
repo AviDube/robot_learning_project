@@ -32,7 +32,7 @@ ENV_ID = "FrankaKitchen-v1"
 @dataclass
 class MBConfig:
     seed: int = 42
-    total_steps: int = 2_000_000
+    total_steps: int = 10_000_000
     random_warmup_steps: int = 10_000
     model_update_every: int = 250
     model_train_epochs: int = 25
