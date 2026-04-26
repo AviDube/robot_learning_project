@@ -1,0 +1,39 @@
+# Python caches/bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Python tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Conda/local env files
+.python-version
+
+# macOS
+.DS_Store
+
+# Training outputs / artifacts
+logs/
+ppo_franka_tb/
+ppo_franka_best/
+ppo_franka_checkpoints/
+ppo_franka_eval_logs/
+
+# Generated media
+franka_kitchen_videos/
+franka_kitchen_eval_videos_parrallel/
+*.mp4
+
+# Saved models and plots
+sac_franka_final.zip
+ppo_franka_kitchen_final*.zip
+ppo_sb3_learning_curve.png

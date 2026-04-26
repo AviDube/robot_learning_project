@@ -41,13 +41,8 @@ os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
 ENV_ID = "FrankaKitchen-v1"
 
-<<<<<<< HEAD
-TOTAL_TIMESTEPS = 2_000_000
-N_ENVS = 8
-=======
 TOTAL_TIMESTEPS = 10_000_000
 N_ENVS = 30
->>>>>>> 5637ac2b97d4560285cecdae97fa2d6aed5d367d
 SEED = 42
 USE_ASR = True
 USE_SHAPED_REWARD = True
